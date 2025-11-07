@@ -7,7 +7,18 @@ if not sys.warnoptions:
     warnings.simplefilter("ignore")
 
 if __name__ == '__main__':
-
+    """
+    Args:
+        tuning_mode (str):      微调模式 prefixtune｜adaptertune
+        prefix_mode (str):      前缀调优模式 embedding | activation
+        mode (str):             执行的任务类型，据此数据化要加载的训练文件、测试文件、保存的模型路径等
+                                cnn_dm | writingPrompts | webnlg | triples | e2e  
+        bsz(int):               batch size                           
+        parametrize_emb(str):   前缀的可训练矩阵参数。
+                                当 prefix_mode == 'embedding 时，使用一个 MLP 及一个更小的矩阵进行重参数化 
+        length_pen (float):       length_penalty                  
+      
+    """
     parser = argparse.ArgumentParser(description='data2text E2E training args.')
     parser.add_argument('--mode', type=str, default='data2text', help='')
     parser.add_argument('--tuning_mode', type=str, default='prefixtune', help='')
@@ -71,19 +82,21 @@ if __name__ == '__main__':
     assert  args.mode in ['e2e', 'cnn_dm', 'webnlg', 'triples', 'xsum', 'xsum_news', 'xsum_news_sport']
 
 
-
+    # E2E 数据集，包含 8 个字段
     if args.mode == 'e2e':
 
         data_dir= 'e2e'
         folder_name = 'save_e2e_models/'
 
-
+    # DART (Radev et al., 2020) is an open domain table-to-text dataset,
+    # with similar input format (entity-relation-entity triples)
+    # DART (entity-relation-entity) 三元组
     elif args.mode == 'triples':
         TRAIN_FILE = "/u/scr/xlisali/DART/dart/data/v1.1.1/dart-v1.1.1-full-train.json"
         TEST_FILE = "/u/scr/xlisali/DART/dart/data/v1.1.1/dart-v1.1.1-full-dev.json"
         folder_name = "triples_models/"
 
-
+    # WebNLG,输入是 (subject, property, object) 三元组
     elif args.mode == 'webnlg':
         # 2017 Challeng Version.
         TRAIN_FILE = "/u/scr/xlisali/WebNLG/webnlg-dataset/webnlg_challenge_2017/train.json"
@@ -112,7 +125,8 @@ if __name__ == '__main__':
 
         assert args.optim_prefix == 'yes'
 
-
+    # For the summarization task, we use the XSUM dataset,
+    # which is an abstractive summarization dataset on news articles.
     elif args.mode == 'xsum':
         data_dir = 'xsum'
         folder_name = "xsum_models/"

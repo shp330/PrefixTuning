@@ -116,7 +116,7 @@ class PrefixTuning(PretrainedBartModel):
                     print(self.wte)
 
 
-
+            # dataless
             if self.mode_para == 1:
                 print('mode_para=1, for dataless.')
                 self.control_trans = nn.Sequential(
