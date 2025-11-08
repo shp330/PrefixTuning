@@ -940,8 +940,8 @@ class PrefixTuning(
         ):
             temp_dict = {
                 'self': {
-                    "prev_key":              key_val[0].contiguous(),
-                    "prev_value":            key_val[1].contiguous(),
+                    "prev_key"             : key_val[0].contiguous(),
+                    "prev_value"           : key_val[1].contiguous(),
                     "prev_key_padding_mask": torch.zeros(
                         bsz,
                         seqlen
@@ -954,8 +954,8 @@ class PrefixTuning(
             if self.use_cross_prefix:
                 key_val2 = past_key_values2[i]
                 temp_dict['encoder_decoder'] = {
-                    "prev_key":              key_val2[0].contiguous(),
-                    "prev_value":            key_val2[1].contiguous(),
+                    "prev_key"             : key_val2[0].contiguous(),
+                    "prev_value"           : key_val2[1].contiguous(),
                     "prev_key_padding_mask": torch.zeros(
                         bsz,
                         seqlen
@@ -966,8 +966,8 @@ class PrefixTuning(
             if self.use_encoder_prefix:
                 key_val_enc = past_key_values_enc[i]
                 temp_dict['encoder'] = {
-                    "prev_key":              key_val_enc[0].contiguous(),
-                    "prev_value":            key_val_enc[1].contiguous(),
+                    "prev_key"             : key_val_enc[0].contiguous(),
+                    "prev_value"           : key_val_enc[1].contiguous(),
                     "prev_key_padding_mask": torch.zeros(
                         bsz_enc,
                         seqlen

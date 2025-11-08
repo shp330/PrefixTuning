@@ -104,12 +104,7 @@ def lmap(
     x: Iterable
 ) -> List:
     """list(map(f, x))"""
-    return list(
-        map(
-            f,
-            x
-        )
-    )
+    return list(map(f, x))
 
 
 def calculate_bleu(
@@ -133,7 +128,7 @@ def calculate_bleu(
 def trim_batch(
     input_ids,
     pad_token_id,
-    attention_mask=None,
+    attention_mask=None
 ):
     """Remove columns that are populated exclusively by pad_token_id"""
     keep_column_mask = input_ids.ne(
@@ -147,9 +142,7 @@ def trim_batch(
         return (input_ids[:, keep_column_mask], attention_mask[:, keep_column_mask])
 
 
-class AbstractSeq2SeqDataset(
-    Dataset
-):
+class AbstractSeq2SeqDataset(Dataset):
     def __init__(
         self,
         tokenizer,
@@ -365,9 +358,9 @@ class LegacySeq2SeqDataset(
         target_ids = target_inputs["input_ids"].squeeze()
         src_mask = source_inputs["attention_mask"].squeeze()
         return {
-            "input_ids":      source_ids,
+            "input_ids"     : source_ids,
             "attention_mask": src_mask,
-            "labels":         target_ids,
+            "labels"        : target_ids,
         }
 
     def collate_fn(
@@ -394,9 +387,9 @@ class LegacySeq2SeqDataset(
             attention_mask=masks
         )
         batch = {
-            "input_ids":      source_ids,
+            "input_ids"     : source_ids,
             "attention_mask": source_mask,
-            "labels":         y,
+            "labels"        : y,
         }
         return batch
 
@@ -618,12 +611,8 @@ class DistributedSortishSampler(
             shuffle=self.shuffle
         )
         indices = [self.available_indices[i] for i in sortish_indices]
-        assert len(
-            indices
-        ) == self.num_samples
-        return iter(
-            indices
-        )
+        assert len(indices) == self.num_samples
+        return iter(indices)
 
     @cached_property
     def available_indices(
@@ -768,16 +757,16 @@ def get_git_info():
         search_parent_directories=True
     )
     repo_infos = {
-        "repo_id":     str(
+        "repo_id"    : str(
             repo
         ),
-        "repo_sha":    str(
+        "repo_sha"   : str(
             repo.head.object.hexsha
         ),
         "repo_branch": str(
             repo.active_branch
         ),
-        "hostname":    str(
+        "hostname"   : str(
             socket.gethostname()
         ),
     }

@@ -115,15 +115,15 @@ class PrefixSummarizationModule(
         )
         n_observations_per_split = {
             "train": self.hparams.n_train,
-            "val":   self.hparams.n_val,
-            "test":  self.hparams.n_test,
+            "val"  : self.hparams.n_val,
+            "test" : self.hparams.n_test,
         }
         self.n_obs = {k: v if v >= 0 else None for k, v in n_observations_per_split.items()}
 
         self.target_lens = {
             "train": self.hparams.max_target_length,
-            "val":   self.hparams.val_max_target_length,
-            "test":  self.hparams.test_max_target_length,
+            "val"  : self.hparams.val_max_target_length,
+            "test" : self.hparams.test_max_target_length,
         }
         assert self.target_lens["train"] <= self.target_lens[
             "val"], f"target_lens: {self.target_lens}"
@@ -408,9 +408,9 @@ class PrefixSummarizationModule(
             [x["preds"] for x in outputs]
         )
         return {
-            "log":                         all_metrics,
-            "preds":                       preds,
-            f"{prefix}_loss":              loss,
+            "log"                        : all_metrics,
+            "preds"                      : preds,
+            f"{prefix}_loss"             : loss,
             f"{prefix}_{self.val_metric}": metric_tensor,
         }
 
@@ -809,15 +809,15 @@ class SummarizationModule(
         )
         n_observations_per_split = {
             "train": self.hparams.n_train,
-            "val":   self.hparams.n_val,
-            "test":  self.hparams.n_test,
+            "val"  : self.hparams.n_val,
+            "test" : self.hparams.n_test,
         }
         self.n_obs = {k: v if v >= 0 else None for k, v in n_observations_per_split.items()}
 
         self.target_lens = {
             "train": self.hparams.max_target_length,
-            "val":   self.hparams.val_max_target_length,
-            "test":  self.hparams.test_max_target_length,
+            "val"  : self.hparams.val_max_target_length,
+            "test" : self.hparams.test_max_target_length,
         }
         assert self.target_lens["train"] <= self.target_lens[
             "val"], f"target_lens: {self.target_lens}"
@@ -1062,9 +1062,9 @@ class SummarizationModule(
             [x["preds"] for x in outputs]
         )
         return {
-            "log":                         all_metrics,
-            "preds":                       preds,
-            f"{prefix}_loss":              loss,
+            "log"                        : all_metrics,
+            "preds"                      : preds,
+            f"{prefix}_loss"             : loss,
             f"{prefix}_{self.val_metric}": metric_tensor,
         }
 

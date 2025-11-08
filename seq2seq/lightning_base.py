@@ -37,22 +37,22 @@ logger = logging.getLogger(
 )
 
 MODEL_MODES = {
-    "base":                    AutoModel,
+    "base"                   : AutoModel,
     "sequence-classification": AutoModelForSequenceClassification,
-    "question-answering":      AutoModelForQuestionAnswering,
-    "pretraining":             AutoModelForPreTraining,
-    "token-classification":    AutoModelForTokenClassification,
-    "language-modeling":       AutoModelWithLMHead,
-    "summarization":           AutoModelForSeq2SeqLM,
-    "translation":             AutoModelForSeq2SeqLM,
+    "question-answering"     : AutoModelForQuestionAnswering,
+    "pretraining"            : AutoModelForPreTraining,
+    "token-classification"   : AutoModelForTokenClassification,
+    "language-modeling"      : AutoModelWithLMHead,
+    "summarization"          : AutoModelForSeq2SeqLM,
+    "translation"            : AutoModelForSeq2SeqLM,
 }
 
 # update this and the import above to support new schedulers from transformers.optimization
 arg_to_scheduler = {
-    "linear":            get_linear_schedule_with_warmup,
-    "cosine":            get_cosine_schedule_with_warmup,
+    "linear"           : get_linear_schedule_with_warmup,
+    "cosine"           : get_cosine_schedule_with_warmup,
     "cosine_w_restarts": get_cosine_with_hard_restarts_schedule_with_warmup,
-    "polynomial":        get_polynomial_decay_schedule_with_warmup,
+    "polynomial"       : get_polynomial_decay_schedule_with_warmup,
     # '': get_constant_schedule,             # not supported for now
     # '': get_constant_schedule_with_warmup, # not supported for now
 }
@@ -164,10 +164,12 @@ class PrefixTransformer(
         else:
             self.config: PretrainedConfig = config
 
-        extra_model_params = ("encoder_layerdrop",
-                              "decoder_layerdrop",
-                              "dropout",
-                              "attention_dropout")
+        extra_model_params = (
+            "encoder_layerdrop",
+            "decoder_layerdrop",
+            "dropout",
+            "attention_dropout"
+        )
         for p in extra_model_params:
             if getattr(
                 self.hparams,
@@ -295,13 +297,13 @@ class PrefixTransformer(
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
-                "params":       [p for n, p in model.named_parameters() if not any(
+                "params"      : [p for n, p in model.named_parameters() if not any(
                     nd in n for nd in no_decay
                 )],
                 "weight_decay": self.hparams.weight_decay,
             },
             {
-                "params":       [p for n, p in model.named_parameters() if any(
+                "params"      : [p for n, p in model.named_parameters() if any(
                     nd in n for nd in no_decay
                 )],
                 "weight_decay": 0.0,
@@ -692,10 +694,12 @@ class BaseTransformer(
         else:
             self.config: PretrainedConfig = config
 
-        extra_model_params = ("encoder_layerdrop",
-                              "decoder_layerdrop",
-                              "dropout",
-                              "attention_dropout")
+        extra_model_params = (
+            "encoder_layerdrop",
+            "decoder_layerdrop",
+            "dropout",
+            "attention_dropout"
+        )
         for p in extra_model_params:
             if getattr(
                 self.hparams,
@@ -767,13 +771,13 @@ class BaseTransformer(
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
-                "params":       [p for n, p in model.named_parameters() if not any(
+                "params"      : [p for n, p in model.named_parameters() if not any(
                     nd in n for nd in no_decay
                 )],
                 "weight_decay": self.hparams.weight_decay,
             },
             {
-                "params":       [p for n, p in model.named_parameters() if any(
+                "params"      : [p for n, p in model.named_parameters() if any(
                     nd in n for nd in no_decay
                 )],
                 "weight_decay": 0.0,
