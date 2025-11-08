@@ -1,5 +1,7 @@
 # from transformers import Trainer
 import torch
+from torch.nn import Embedding, Sequential
+
 from transformers import (
     PreTrainedModel,
     GPT2PreTrainedModel,
@@ -7,18 +9,72 @@ from transformers import (
     PretrainedBartModel,
 )
 from torch import nn
+from typing import Optional, Literal
 
 
 class PrefixTuning(PretrainedBartModel):
-    """Classification Head for  transformer encoders"""
+    """Classification Head for  transformer encoders
+
+    Attributes:
+        preseqlen (int): 前缀优化序列长度
+        optim_prefix (bool): 是否前缀优化
+        use_infix (bool): 是否使用 infix
+        use_deep (bool):  是否使用深度模式
+        match_n_layer (int): 解码器层数
+        match_n_head (int):  解码器注意力头数
+        n_embd (int):  嵌入的维度
+        task_mode (str):  任务模式
+        tuning_mode (str):  微调模式：prefixtune
+        train_weights (bool):  是否训练权重
+        format_mode (str):  前缀与输入的拼接格式 ["cat", "infix", "peek", "nopeek"]
+        prefix_dropout (float): 前缀 dropout 值
+        init_random (bool): 是否随机初始化
+        mid_dim (int):
+        lowdata (bool):
+        lowdata_token (str):
+        task_mode (str): 任务模式,，必须为以下值：
+                - writingPrompts
+                - webnlg
+                - triples
+                - data2text
+                - dataless
+        mode_para (int): [0, 1(dataless), 2(writingPrompts、webnlg、triples、data2text),3, 4]
+        wte (Embedding): 权重嵌入
+        wte_enc (Embedding): encoder prefix 的权重嵌入
+        control_trans (Sequential): 控制转换，是一个 MLP
+
+    """
+
+    preseqlen: int = 5
+    optim_prefix: bool = False
+    use_infix: bool = False
+    use_deep: bool = False
+    match_n_layer: int
+    match_n_head: int
+    n_embd: int
+    task_mode: Literal["writingPrompts", "webnlg", "triples", "data2text", "dataless"]
+    tuning_mode: str
+    train_weights: bool
+    format_mode: Literal["cat", "infix", "peek", "nopeek"] = "cat"
+    prefix_dropout: float = 0.0
+    init_random: bool = False
+    mid_dim: int = 512
+    lowdata: bool = False
+    lowdata_token: Optional[str] = None
+    mode_para: Literal[0, 1, 2, 3, 4] = 1
+    wte: Embedding
+    wte_enc: Embedding
+    control_trans: Sequential
+    use_cross_prefix: bool
+    use_encoder_prefix: bool = True
 
     def __init__(
         self,
         config,
         model_gpt2,
-        optim_prefix=False,
-        preseqlen=5,
-        use_infix=False,
+        optim_prefix: bool = False,
+        preseqlen: int = 5,
+        use_infix: bool = False,
         deep_param=False,
     ):
         super().__init__(config)
@@ -113,7 +169,7 @@ class PrefixTuning(PretrainedBartModel):
             # self.mode_para=0 and optim_prefix == True for Instruction based.
         else:
             self.mode_para = 4
-
+        # 不是前缀优化
         if not self.optim_prefix:
             if self.train_weights:
                 self.wte = model_gpt2.transformer.wte
