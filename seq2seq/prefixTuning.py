@@ -3,8 +3,8 @@ import torch
 from torch.nn import Embedding, Sequential
 
 from transformers import (
-    PreTrainedModel,
     GPT2PreTrainedModel,
+    PreTrainedTokenizer,
     GPT2Tokenizer,
     PretrainedBartModel,
 )
@@ -20,6 +20,7 @@ class PrefixTuning(PretrainedBartModel):
         optim_prefix (bool): 是否前缀优化
         use_infix (bool): 是否使用 infix
         use_deep (bool):  是否使用深度模式
+        n_layer (int):
         match_n_layer (int): 解码器层数
         match_n_head (int):  解码器注意力头数
         n_embd (int):  嵌入的维度
@@ -29,9 +30,9 @@ class PrefixTuning(PretrainedBartModel):
         format_mode (str):  前缀与输入的拼接格式 ["cat", "infix", "peek", "nopeek"]
         prefix_dropout (float): 前缀 dropout 值
         init_random (bool): 是否随机初始化
-        mid_dim (int):
-        lowdata (bool):
-        lowdata_token (str):
+        mid_dim (int): 隐藏层维度
+        lowdata (bool): 是否低数据场景？
+        lowdata_token (str): 低数据场景的初始化 token
         task_mode (str): 任务模式,，必须为以下值：
                 - writingPrompts
                 - webnlg
@@ -49,6 +50,7 @@ class PrefixTuning(PretrainedBartModel):
     optim_prefix: bool = False
     use_infix: bool = False
     use_deep: bool = False
+    n_layer: int
     match_n_layer: int
     match_n_head: int
     n_embd: int
@@ -236,7 +238,7 @@ class PrefixTuning(PretrainedBartModel):
                     self.preseqlen
                 )
             )
-
+            # 低数据场景，并且没有初始化 token
             if self.lowdata and self.lowdata_token is not None:
                 low_data_init = 3
                 if low_data_init == 1:
@@ -245,6 +247,10 @@ class PrefixTuning(PretrainedBartModel):
                     )
                     # self.control_trans = nn.Parameter(torch.randn(self.preseqlen * config.n_layer * 2 * config.n_embd))
                     self.get_prompt = self.get_prompt_p22
+
+                    # 参数 "gpt2-medium" 指定加载的是「中等尺寸 GPT-2 模型」的配套分词器 —— 但分词器的类类型与模型尺寸无关：
+                    # 无论加载 gpt2（基础版）、gpt2-medium（中等版）、gpt2-large（大型版）还是 gpt2-xl（超大型版），
+                    # 返回的都是 GPT2Tokenizer 类实例，差异仅在于分词器的词汇表（vocab）和配置（但 GPT-2 全系列共享同一套词汇表，因此实际差异极小）。
                     tokenizer = GPT2Tokenizer.from_pretrained("gpt2-medium")
                     sample_text = "name : Blue Spice | Type : coffee shop | customer rating : 5 out of 5 | near : Crowne Plaza Hotel||The coffee shop Blue Spice is based near Crowne Plaza Hotel and has a high customer rating of 5 out of 5 ."
                     src, tgt = sample_text.split("||")
@@ -350,11 +356,6 @@ class PrefixTuning(PretrainedBartModel):
                 else:
                     self.get_prompt = self.get_prompt_p5
 
-                if self.use_infix:
-                    self.get_prompt = self.get_prompt_p5_infix
-                else:
-                    self.get_prompt = self.get_prompt_p5
-
                 self.use_encoder_prefix = True
                 self.use_cross_prefix = True
 
@@ -399,7 +400,38 @@ class PrefixTuning(PretrainedBartModel):
                 gpt2=model_gpt2, sample_input=torch.LongTensor(self.lowdata_token)
             )
 
-    def lowdata_init_train1(self, gpt2, tokenizer, sample_input):
+    def lowdata_init_train1(
+        self,
+        gpt2: GPT2PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        sample_input: str,
+    ):
+        """
+
+        Args:
+            gpt2: gpt2 模型
+            tokenizer:  与 GPT-2 配套的分词器（transformers.GPT2Tokenizer），用于将文本转换为模型可识别的张量。
+            sample_input: 样本输入文本（字符串），用于触发 GPT-2 生成缓存键值对（仅需少量样本即可）。
+
+        Notes:
+            tokenizer:
+                GPT2Tokenizer 继承自 transformers.PreTrainedTokenizer（所有 Hugging Face 分词器的基类），
+                因此它具备所有预训练分词器的核心方法（如 __call__、encode、decode、pad 等）。
+
+            gpt2:
+                - GPT2PreTrainedModel 是顶层基类: 处理配置、加载 / 保存权重、设备迁移;
+                - GPT2Model 基础编码器（编码器）: 功能：接收输入，输出各层隐藏态;
+                                               输出：最后一层隐藏态、可选所有层隐藏态/注意力权重
+                                               典型用途：特征提取、下游任务微调（如分类）
+                - GPT2LMHeadModel 是带语言建模头的任务模型: 功能：基于 GPT2Model + 语言建模头
+                                                        输出：每个 token 的下一个 token 预测概率
+                                                        典型用途：文本生成、自回归语言建模（LM 任务）
+
+        Returns:
+
+        """
+        # 使用分词器 tokenizer 处理输入文本 sample_input，将其转换为模型所需的 PyTorch 张量
+        # return_tensors="pt" 指定返回 PyTorch 张量。
         input = tokenizer(sample_input, return_tensors="pt")
         output = gpt2(
             input["input_ids"].to(gpt2.device), return_dict=True, use_cache=True
