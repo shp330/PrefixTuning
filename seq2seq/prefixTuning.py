@@ -391,7 +391,7 @@ class PrefixTuning(PretrainedBartModel):
         print("total param is {}".format(total_param))
 
         if low_data_init == 2:
-            self.lowdata_init_train2(
+            self.lowdata_init_train_prompt(
                 gpt2=model_gpt2, tokenizer=tokenizer, sample_input=sample_input
             )
         elif low_data_init == 3:
@@ -495,20 +495,51 @@ class PrefixTuning(PretrainedBartModel):
         # 后续训练时会随反向传播更新梯度（这是实现「基于缓存初始化可训练参数」的核心步骤）
         return torch.nn.Parameter(output)
 
-    def get_prompt_p22(self, control_code=None, gpt2=None, bsz=None):
+    def get_prompt_p22(self, control_code=None, gpt2=None, bsz: int = None):
+        """
+        其目的是生成或准备一组可作为 GPT-2 的 past_key_values 的张量，
+        通常用于 prompt tuning / prefix tuning / soft prompting 等参数高效微调方法中。
+
+        Args:
+            control_code:
+            gpt2:
+            bsz: 批量大小
+
+        Returns:
+
+        """
         assert bsz is not None
+        # - self.control_trans 很可能是一个可学习的 prefix/prompt 参数张量
+        #     其形状通常为：(num_layers, bsz, num_heads, prefix_len, head_dim)
+        # - 在 Hugging Face 的 GPT-2 中，past_key_values 的标准格式是：
+        #     Tuple[Tuple[torch.Tensor, torch.Tensor], ...]  # 长度 = num_layers
+        #     每层: (key: [B, H, L, D], value: [B, H, L, D]) 【Batch, num_Heads, Length, Dim】
+        # - split(2, dim=0)
+        #     self.control_trans 第 0 维长度是 2 * num_layers（比如 24 层 → 48），那么：
+        #     返回的是 tuple of 24 tensors，每个 tensor 包含 [key_part, value_part]（堆叠在一起）
         past_key_values = self.control_trans.expand(-1, bsz, -1, -1, -1).split(2, dim=0)
         return past_key_values
 
-    def lowdata_init_train2(
-        self, gpt2, tokenizer, sample_input, epochs=500
-    ):  # prev=500
+    def lowdata_init_train_prompt(
+        self, gpt2, tokenizer, sample_input, epochs: int = 500
+    ) -> None:  # prev=500
+        """
+        对 prompt 训练 epochs
+        Args:
+            gpt2:
+            tokenizer:
+            sample_input:
+            epochs:
+
+        Returns:
+
+        """
         self = self.cuda()
         gpt2 = gpt2.cuda()
         with torch.no_grad():
-            input = tokenizer(sample_input, return_tensors="pt")
+            _input = tokenizer(sample_input, return_tensors="pt")
             output = gpt2(
-                input["input_ids"].to(gpt2.device), return_dict=True, use_cache=True
+                _input["input_ids"].to(gpt2.device), return_dict=True, use_cache=True
             )
             output = output.past_key_values
             print(len(output), output[0].shape)
