@@ -1,6 +1,6 @@
 # from transformers import Trainer
 import torch
-from torch.nn import Embedding, Sequential
+from torch.nn import Embedding, Sequential, Parameter
 
 from transformers import (
     GPT2PreTrainedModel,
@@ -405,8 +405,9 @@ class PrefixTuning(PretrainedBartModel):
         gpt2: GPT2PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
         sample_input: str,
-    ):
+    ) -> Parameter:
         """
+        用少量样本触发 GPT-2 生成中间特征（past_key_values），并将这些特征转换为可训练参数
 
         Args:
             gpt2: gpt2 模型
@@ -426,19 +427,70 @@ class PrefixTuning(PretrainedBartModel):
                 - GPT2LMHeadModel 是带语言建模头的任务模型: 功能：基于 GPT2Model + 语言建模头
                                                         输出：每个 token 的下一个 token 预测概率
                                                         典型用途：文本生成、自回归语言建模（LM 任务）
+            应用场景：
+            - 低数据量微调：当训练数据极少时，直接用随机初始化的参数训练容易过拟合，用预训练模型的缓存特征初始化参数，可快速收敛。
+            - 迁移学习：将 GPT-2 学到的语言特征（蕴含在 key/value 中）作为下游任务的初始化参数，提升模型起点。
+            - 参数高效微调（PEFT）：仅训练这部分由缓存初始化的参数，冻结原始 GPT-2 模型权重，减少计算量。
+            潜在注意点
+            - 输入长度影响：sample_input 的长度会决定 past_key_values 中 seq_len 的维度，需根据下游任务需求选择合适的样本长度。
+            - 设备一致性：需确保 sample_input 编码后的张量与 gpt2 模型在同一设备（CPU/GPU），否则会报错【代码中通过 .to(gpt2.device) 处理】。
+            - 模型类型：仅适用于支持 past_key_values 的自回归模型（如 GPT 系列），其他模型（如 BERT）不支持该参数。
+            - 张量形状：拼接后的张量维度较高（num_layers * 2, 1, num_heads, seq_len, head_dim），需确保后续模块能处理该形状。
 
         Returns:
 
         """
         # 使用分词器 tokenizer 处理输入文本 sample_input，将其转换为模型所需的 PyTorch 张量
-        # return_tensors="pt" 指定返回 PyTorch 张量。
-        input = tokenizer(sample_input, return_tensors="pt")
+        # - return_tensors="pt" 指定返回 PyTorch 张量。
+        #
+        # - 输出 _input 是一个字典，核心键值对：
+        #   - input_ids：文本对应的整数编码（每个词/子词映射为一个唯一整数），形状为 [1, seq_len]（1 是批次大小，seq_len 是输入文本的长度）。
+        #   - attention_mask（默认自动生成）：注意力掩码，标记哪些位置是有效输入（1）、哪些是填充（0），形状同 input_ids。
+        _input = tokenizer(sample_input, return_tensors="pt")
+
+        # 将编码后的 input_ids 传入 GPT-2 模型，执行一次前向推理，核心目的是获取 past_key_values（缓存的键值对）
+        #
+        # - input["input_ids"].to(gpt2.device)：
+        #     将 input_ids 张量移到模型所在设备（CPU/GPU，确保数据和模型在同一设备）
+        # - return_dict=True：
+        #     指定模型输出为 ModelOutput 对象（类似字典，可通过属性访问结果），而非元组。
+        # - use_cache=True：
+        #     核心参数，GPT-2 是自回归模型，use_cache=True 会让模型在推理时缓存每一层 Transformer 的「键」和「值」张量（用于后续快速生成下一个 token），
+        #     这些缓存就是 past_key_values。
+        # - 输出 output：
+        #     包含模型前向结果的对象
         output = gpt2(
-            input["input_ids"].to(gpt2.device), return_dict=True, use_cache=True
+            _input["input_ids"].to(gpt2.device), return_dict=True, use_cache=True
         )
+        # past_key_values 缓存的键值对
+        # past_key_values 是一个元组，元组长度为 GPT-2 的 Transformer 层数（比如 GPT-2 基础版有 12 层，元组长度就是 12）
+        # 元组中每个元素是一个二元组 (key, value)：
+        #   - key：当前层多头注意力的「键」张量，形状为 [1, num_heads, seq_len, head_dim]
+        #       （1 = 批次，num_heads = 注意力头数，seq_len = 输入长度，head_dim = 每个头的维度）。
+        #   - value：当前层多头注意力的「值」张量，形状与 key 完全一致。
         output = output.past_key_values
+
+        # output[0].shape：
+        #   第一层 (key, value) 的形状（即，二元组 (key, value) 的形状，会显示为两个张量的形状）。
+        #   比如：对于 GPT-2 基础版，输入长度为 10 时，输出为：
+        #       12, (torch.Size([1, 12, 10, 64]), torch.Size([1, 12, 10, 64]))
+        #         - 12：Transformer 层数
+        #         - 第一个张量 key 的形状（1 = 批次，12 = 注意力头数，10 = 输入长度，64 = 每个头的维度）。
+        #         - 第二个张量 value 的形状（与 key 一致）。
         print(len(output), output[0].shape)
+
+        # - torch.cat(output, dim=0)：
+        #     将 past_key_values 元组中的所有 (key, value) 二元组沿 dim=0（层数维度）拼接。
+        #     拼接前：每个元素是 (key, value)（形状均为 [1, num_heads, seq_len, head_dim]），元组长度为 num_layers。
+        #     拼接后：张量形状为 [num_layers * 2, 1, num_heads, seq_len, head_dim]（因为每个层贡献 2 个张量（key+value），所以第一维是 num_layers * 2）。
+        # - detach()：
+        #     剥离张量的计算图（切断与模型前向传播的梯度依赖），使其成为「纯数据张量」（
+        #     后续转换为参数时，梯度会重新计算，此处仅为了脱离原始模型的计算图）。
         output = torch.cat(output, dim=0).detach()
+
+        # 将处理后的张量转换为 torch.nn.Parameter（PyTorch 中的可训练参数）并返回。
+        # Parameter 是张量的子类，会被自动注册到模型的参数列表中，
+        # 后续训练时会随反向传播更新梯度（这是实现「基于缓存初始化可训练参数」的核心步骤）
         return torch.nn.Parameter(output)
 
     def get_prompt_p22(self, control_code=None, gpt2=None, bsz=None):
