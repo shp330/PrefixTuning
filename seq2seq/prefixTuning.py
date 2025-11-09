@@ -454,7 +454,7 @@ class PrefixTuning(PretrainedBartModel):
         #     将 input_ids 张量移到模型所在设备（CPU/GPU，确保数据和模型在同一设备）
         # - return_dict=True：
         #     指定模型输出为 ModelOutput 对象（类似字典，可通过属性访问结果），而非元组。
-        # - use_cache=True：
+        # - use_cache=True：【use_cache=True 仅在推理时有用，训练时通常设为 False（因为需要完整反向传播）。】
         #     核心参数，GPT-2 是自回归模型，use_cache=True 会让模型在推理时缓存每一层 Transformer 的「键」和「值」张量（用于后续快速生成下一个 token），
         #     这些缓存就是 past_key_values。
         # - 输出 output：
@@ -462,9 +462,11 @@ class PrefixTuning(PretrainedBartModel):
         output = gpt2(
             _input["input_ids"].to(gpt2.device), return_dict=True, use_cache=True
         )
-        # past_key_values 缓存的键值对
-        # past_key_values 是一个元组，元组长度为 GPT-2 的 Transformer 层数（比如 GPT-2 基础版有 12 层，元组长度就是 12）
-        # 元组中每个元素是一个二元组 (key, value)：
+        # past_key_values：KV 缓存（Key-Value Cache），用于加速自回归生成（因为 use_cache=True）
+        #   结构：(layer0_kv, layer1_kv, ..., layerN_kv)，每层包含 (key, value) 缓存的键值对；即：
+        #     Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
+        #   past_key_values 是一个元组，元组长度为 GPT-2 的 Transformer 层数（比如 GPT-2 基础版有 12 层，元组长度就是 12）
+        #     元组中每个元素是一个二元组 (key, value)：
         #   - key：当前层多头注意力的「键」张量，形状为 [1, num_heads, seq_len, head_dim]
         #       （1 = 批次，num_heads = 注意力头数，seq_len = 输入长度，head_dim = 每个头的维度）。
         #   - value：当前层多头注意力的「值」张量，形状与 key 完全一致。
