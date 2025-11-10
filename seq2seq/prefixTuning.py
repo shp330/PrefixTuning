@@ -8,7 +8,7 @@ from transformers import (
     GPT2Tokenizer,
     PretrainedBartModel,
 )
-from torch import nn
+from torch import nn, Tensor
 from typing import Optional, Literal
 
 
@@ -238,7 +238,7 @@ class PrefixTuning(PretrainedBartModel):
                     self.preseqlen
                 )
             )
-            # 低数据场景，并且没有初始化 token
+            # 低数据场景
             if self.lowdata and self.lowdata_token is not None:
                 low_data_init = 3
                 if low_data_init == 1:
@@ -391,12 +391,12 @@ class PrefixTuning(PretrainedBartModel):
         print("total param is {}".format(total_param))
 
         if low_data_init == 2:
-            self.lowdata_init_tokenize_train(
+            self.lowdata_init_need_tokenize_train(
                 gpt2=model_gpt2, tokenizer=tokenizer, sample_input=sample_input
             )
         elif low_data_init == 3:
             print("use pt for this tensor", torch.LongTensor(self.lowdata_token))
-            self.lowdata_init_no_tokenize_train(
+            self.lowdata_init_not_need_tokenize_train(
                 gpt2=model_gpt2, sample_input=torch.LongTensor(self.lowdata_token)
             )
 
@@ -520,8 +520,8 @@ class PrefixTuning(PretrainedBartModel):
         past_key_values = self.control_trans.expand(-1, bsz, -1, -1, -1).split(2, dim=0)
         return past_key_values
 
-    def lowdata_init_tokenize_train(
-        self, gpt2, tokenizer, sample_input, epochs: int = 500
+    def lowdata_init_need_tokenize_train(
+        self, gpt2, tokenizer, sample_input: str, epochs: int = 500
     ) -> None:  # prev=500
         """
         样本训练前使用传入的分词器分词
@@ -616,14 +616,14 @@ class PrefixTuning(PretrainedBartModel):
                 print(f"Epoch [{e+1}/{epochs}], Loss: {loss.item():.4f}")
         return
 
-    def lowdata_init_no_tokenize_train(
-        self, gpt2, sample_input, epochs=500
+    def lowdata_init_not_need_tokenize_train(
+        self, gpt2, sample_input: Tensor, epochs=500
     ):  # prev=500
         """
-        样本训练前不分词
+        样本已分词，不需要在方法内再分词
         Args:
             gpt2:
-            sample_input:
+            sample_input: 已分词的训练样本
             epochs:
 
         Returns:
