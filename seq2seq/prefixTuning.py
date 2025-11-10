@@ -391,12 +391,12 @@ class PrefixTuning(PretrainedBartModel):
         print("total param is {}".format(total_param))
 
         if low_data_init == 2:
-            self.lowdata_init_train_prompt(
+            self.lowdata_init_tokenize_train(
                 gpt2=model_gpt2, tokenizer=tokenizer, sample_input=sample_input
             )
         elif low_data_init == 3:
             print("use pt for this tensor", torch.LongTensor(self.lowdata_token))
-            self.lowdata_init_train3(
+            self.lowdata_init_no_tokenize_train(
                 gpt2=model_gpt2, sample_input=torch.LongTensor(self.lowdata_token)
             )
 
@@ -520,10 +520,11 @@ class PrefixTuning(PretrainedBartModel):
         past_key_values = self.control_trans.expand(-1, bsz, -1, -1, -1).split(2, dim=0)
         return past_key_values
 
-    def lowdata_init_train_prompt(
+    def lowdata_init_tokenize_train(
         self, gpt2, tokenizer, sample_input, epochs: int = 500
     ) -> None:  # prev=500
         """
+        样本训练前使用传入的分词器分词
         Prompt 初始化训练：训练完成后，control_trans 生成的 our_prompt 可作为初始化 Prompt，
         用于下游任务（如文本生成、微调），提升模型在低数据量下的性能。
 
@@ -615,9 +616,22 @@ class PrefixTuning(PretrainedBartModel):
                 print(f"Epoch [{e+1}/{epochs}], Loss: {loss.item():.4f}")
         return
 
-    def lowdata_init_train3(self, gpt2, sample_input, epochs=500):  # prev=500
-        self = self.cuda()
-        gpt2 = gpt2.cuda()
+    def lowdata_init_no_tokenize_train(
+        self, gpt2, sample_input, epochs=500
+    ):  # prev=500
+        """
+        样本训练前不分词
+        Args:
+            gpt2:
+            sample_input:
+            epochs:
+
+        Returns:
+
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self = self.to(device)
+        gpt2 = gpt2.to(device)
         with torch.no_grad():
             output = gpt2(
                 sample_input.to(gpt2.device), return_dict=True, use_cache=True
