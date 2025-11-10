@@ -524,7 +524,19 @@ class PrefixTuning(PretrainedBartModel):
         self, gpt2, tokenizer, sample_input, epochs: int = 500
     ) -> None:  # prev=500
         """
-        对 prompt 训练 epochs
+        Prompt 初始化训练：训练完成后，control_trans 生成的 our_prompt 可作为初始化 Prompt，
+        用于下游任务（如文本生成、微调），提升模型在低数据量下的性能。
+
+        用少量样本输入 GPT-2 模型得到「注意力缓存键值对（past_key_values）」，
+        以该缓存为「目标值」，通过 MSE 损失训练自定义的 control_trans 模块生成匹配的 Prompt（our_prompt），
+        本质是「用预训练模型的中间特征监督 Prompt 生成」，适用于低数据量场景的 Prompt 初始化
+
+        目标：
+        在低数据量场景下，避免随机初始化 Prompt 导致的训练不稳定 / 收敛慢问题 ——
+        通过 GPT-2 预训练模型的「中间特征（past_key_values）」作为监督信号，
+        训练 control_trans 模块生成「符合预训练模型语义分布」的 Prompt，
+        为后续下游任务（如文本生成、微调）提供高质量初始化。
+
         Args:
             gpt2:
             tokenizer:
@@ -534,29 +546,73 @@ class PrefixTuning(PretrainedBartModel):
         Returns:
 
         """
-        self = self.cuda()
-        gpt2 = gpt2.cuda()
+        # 自动检测可用设备（优先 GPU，无则用 CPU）
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self = self.to(device)
+        gpt2 = gpt2.to(device)
+        # 生成 GPT-2 目标特征（无梯度追踪）
+        # 生成监督目标
+        # torch.no_grad() 表示不追踪梯度（仅用 GPT-2 生成特征，不更新 GPT-2 权重）：
         with torch.no_grad():
+            # 将文本 sample_input 编码为 GPT-2 可识别的张量, input_ids 形状为 [1, seq_len]
             _input = tokenizer(sample_input, return_tensors="pt")
+            # 开启 use_cache=True 以获取 past_key_values（注意力缓存键值对）
             output = gpt2(
                 _input["input_ids"].to(gpt2.device), return_dict=True, use_cache=True
             )
+            ## !! WARN !! output = output.past_key_values 是「二元组的元组」，直接 cat 会报错
+            # past_kv = output.past_key_values
+            # # 拆解 (k,v) 二元组，提取所有张量组成纯列表
+            # all_kv_tensors = [tensor for k, v in past_kv for tensor in (k, v)]
+            # # 拼接为目标特征张量（形状：[num_layers*2, batch_size, num_heads, seq_len, head_dim]）
+            # output=torch.cat(all_kv_tensors, dim=0)
             output = output.past_key_values
             print(len(output), output[0].shape)
             output = torch.cat(output, dim=0)
 
+        # 创建 Adam 优化器，仅优化 self.control_trans 模块的参数
+        # control_trans 是生成 Prompt 的核心模块，自定义实现
+        # 学习率：lr=1e-4（适中的学习率，适合 Prompt 微调）
         optimizer_temp = torch.optim.Adam(self.control_trans.parameters(), lr=0.0001)
 
+        # 均方误差，衡量两个张量的数值差异
+        loss_metrics = nn.MSELoss()
+        # Prompt 训练循环
+        # 每轮迭代的目标：
+        #   让 control_trans 生成的 our_prompt 与 GPT-2 的 past_key_values 特征尽可能接近（MSE 损失最小化）：
         for e in range(epochs):
-            our_prompt = self.get_prompt_p5(bsz=1)
-            our_prompt = torch.cat(our_prompt, dim=0)
-            loss_metrics = nn.MSELoss()
-            loss = loss_metrics(our_prompt.to(gpt2.device), output)
-            print(loss)
-            loss.backward()
-            optimizer_temp.step()
+            # 清空梯度（避免梯度累积，每轮迭代独立计算）
+            # 由于 optimizer_temp 仅绑定了 self.control_trans 的参数，
+            # 也可以调用优化器的 zero_grad() 方法清空梯度（效果与 self.control_trans.zero_grad() 完全一致，更通用）：
+            #     optimizer_temp.zero_grad()  # 优化器清空绑定参数的梯度
             self.control_trans.zero_grad()
 
+            # 1、调用自定义方法生成 Prompt（需确保返回格式可拼接，形状匹配 target_feature）
+            # get_prompt_p5 返回与 past_key_values 结构匹配的张量序列： 与 past_key_values 一致，或直接返回可拼接的张量列表。
+            our_prompt = self.get_prompt_p5(bsz=1)
+            our_prompt = torch.cat(our_prompt, dim=0)
+
+            # 2、计算损失（!! INFO !! 确保 our_prompt 与 output 形状完全一致，否则损失计算报错）
+            # 计算 our_prompt 与 output（GPT-2 目标特征）的损失。需确保两者形状完全一致，否则报错
+            #   假设使用 gpt2-medium（24 层、16 头、head_dim=64），sample_input 编码后 seq_len=10：
+            #   拆解并拼接后的 output 形状：(48, 1, 16, 10, 64)（24 层 × 2 个张量 / 层 = 48，后续维度与 k/v 一致）。
+            #   our_prompt 拼接后必须完全匹配该形状（(48, 1, 16, 10, 64)）—— 需确保 get_prompt_p5 生成的 Prompt 张量序列，拼接后维度与目标一致。
+            loss = loss_metrics(our_prompt.to(gpt2.device), output)
+            # 反向传播计算梯度（仅更新 control_trans 的参数，GPT-2 权重固定）。
+
+            # 3、计算梯度，梯度存储在参数的 .grad 属性中
+            loss.backward()
+            # 可选：梯度裁剪（防止梯度爆炸）
+            # torch.nn.utils.clip_grad_norm_(
+            #     self.control_trans.parameters(), max_norm=1.0
+            # )
+
+            # 4、优化器根据梯度更新参数
+            optimizer_temp.step()
+
+            # 5、打印损失（每 10 轮打印一次，避免刷屏）
+            if (e + 1) % 10 == 0:
+                print(f"Epoch [{e+1}/{epochs}], Loss: {loss.item():.4f}")
         return
 
     def lowdata_init_train3(self, gpt2, sample_input, epochs=500):  # prev=500
@@ -648,6 +704,18 @@ class PrefixTuning(PretrainedBartModel):
         return past_key_values
 
     def get_prompt_p5(self, control_code=None, gpt2=None, bsz=None, sample_size=1):
+        """
+
+        Args:
+            control_code:
+            gpt2:
+            bsz:
+            sample_size:
+
+        Returns:
+            返回「与 past_key_values 结构匹配的张量序列」：与 past_key_values 一致，或直接返回可拼接的张量列表。
+
+        """
         old_bsz = bsz
         bsz = bsz * sample_size
         input_tokens = self.input_tokens.unsqueeze(0).expand(bsz, -1).to(self.device)
