@@ -1,6 +1,6 @@
 # from transformers import Trainer
 import torch
-from torch.nn import Embedding, Sequential, Parameter
+from torch.nn import Embedding, Sequential, Parameter, Module
 
 from transformers import (
     GPT2PreTrainedModel,
@@ -16,19 +16,21 @@ class PrefixTuning(PretrainedBartModel):
     """Classification Head for  transformer encoders
 
     Attributes:
-        preseqlen (int): 前缀优化序列长度
+        preseqlen (int): Prompt 的序列长度（生成的 Prompt 包含多少个「虚拟 token」）（前缀优化序列长度？）
         optim_prefix (bool): 是否前缀优化
         use_infix (bool): 是否使用 infix
         use_deep (bool):  是否使用深度模式
         n_layer (int):
-        match_n_layer (int): 解码器层数
-        match_n_head (int):  解码器注意力头数
+        match_n_layer (int): 匹配的 GPT-2 模型层数（如 24 层，需与目标 GPT-2 一致）。（解码器层数？）
+        match_n_head (int):  匹配的 GPT-2 注意力头数（如 16 头，需与目标 GPT-2 一致）（解码器注意力头数？）
+        match_n_embd (int):  每个注意力头的维度（如 64，match_n_embd = hidden_size / match_n_head）。
         n_embd (int):  嵌入的维度
         task_mode (str):  任务模式
         tuning_mode (str):  微调模式：prefixtune
         train_weights (bool):  是否训练权重
         format_mode (str):  前缀与输入的拼接格式 ["cat", "infix", "peek", "nopeek"]
         prefix_dropout (float): 前缀 dropout 值
+        dropout(Module): dropout 层（防止过拟合，对生成的 Prompt 特征进行随机失活）
         init_random (bool): 是否随机初始化
         mid_dim (int): 隐藏层维度
         lowdata (bool): 是否低数据场景？
@@ -53,12 +55,14 @@ class PrefixTuning(PretrainedBartModel):
     n_layer: int
     match_n_layer: int
     match_n_head: int
+    match_n_embd: int
     n_embd: int
     task_mode: Literal["writingPrompts", "webnlg", "triples", "data2text", "dataless"]
     tuning_mode: str
     train_weights: bool
     format_mode: Literal["cat", "infix", "peek", "nopeek"] = "cat"
     prefix_dropout: float = 0.0
+    dropout: Module
     init_random: bool = False
     mid_dim: int = 512
     lowdata: bool = False
@@ -654,16 +658,64 @@ class PrefixTuning(PretrainedBartModel):
         return
 
     def get_prompt_p2(self, control_code=None, gpt2=None, bsz=None):
+        """
+        用于 生成「结构化 Prompt 张量」的方法：
+            将 control_trans 模块的输出转换为与 GPT-2 模型 past_key_values 结构完全匹配的格式，
+            以便后续与模型的注意力缓存键值对进行拼接或损失计算
+        Args:
+            control_code:
+            gpt2:
+            bsz:
+
+        Returns:
+
+        Notes:
+            方法作用：
+              - 格式对齐：生成的 past_key_values 与 GPT-2 模型输出的 past_key_values 结构完全一致，可直接用于：
+                  - 计算 MSE 损失（如你之前的训练代码中 loss_metrics(our_prompt, output)）。
+                  - 与 GPT-2 的注意力缓存拼接（扩展模型输入序列）。
+              - 可训练性：self.control_trans 是可训练参数，通过调整它的输出，可让生成的 Prompt 逼近目标特征（如 GPT-2 预训练特征）。
+              - 批次适配：通过 expand(bsz, ...) 支持批量处理，提升训练和推理效率。
+            总结：
+              get_prompt_p2 是一个「格式转换桥梁」，将 control_trans 模块的原始输出转换为与 GPT-2 past_key_values 完全匹配的结构化 Prompt 张量。
+                其核心逻辑是：重塑维度 → 扩展批次 → 调整顺序 → 拆分层次，
+                最终输出可直接用于与 GPT-2 注意力缓存进行损失计算或拼接的 Prompt 键值对。
+              这种设计在「Prompt 微调」或「低数据量初始化」场景中非常关键，确保了生成的 Prompt 能被 GPT-2 模型有效利用。
+
+        """
         assert bsz is not None
+        # self.control_trans：生成 Prompt 基础特征的模块（通常是一个可训练的参数或神经网络层，输出原始特征张量）。
+        # 1. 重塑 control_trans 输出为 5 维特征；
+        #    这一步是为了让 control_trans 的输出维度与 GPT-2 的 key/value 张量维度对齐
         temp_control = self.control_trans.view(
             1,
             self.preseqlen,
+            # 每个 Transformer 层包含 key 和 value 两个张量，因此总数量是 层数×2（如 24 层 → 48）
             self.match_n_layer * 2,
-            self.match_n_head,
-            self.match_n_embd,
+            self.match_n_head,  # 注意力头数（与 GPT-2 一致）
+            self.match_n_embd,  # 每个注意力头的维度（与 GPT-2 一致）
         ).expand(bsz, -1, -1, -1, -1)
+        # 应用 dropout 防止过拟合: 对扩展后的 Prompt 特征进行随机失活（按一定概率将部分元素置为 0），增强模型泛化能力。
         temp_control = self.dropout(temp_control)
+        # - permute：调整维度顺序并拆分层次，目的是让输出格式与 GPT-2 的 past_key_values 完全一致,即：
+        #   (总key/value数, 批次, 头数, 序列长, 头维度)。
+        #   - 原维度索引：[0:bsz, 1:preseqlen, 2:layer×2, 3:head, 4:embd]
+        #   - 新维度索引：(match_n_layer×2, bsz, match_n_head, preseqlen, match_n_embd)
+        # - split(2) → 按「每 2 个元素一组」拆分张量：
+        #   - match_n_layer×2 维度被拆分为 match_n_layer 组，每组包含 2 个张量（分别对应 key 和 value）。
+        #   - 拆分后 past_key_values 是一个元组，长度为 match_n_layer（与 GPT-2 层数一致）。
+        #   - 元组中每个元素是一个二元组 (key_prompt, value_prompt)，形状均为：
+        #     (bsz, match_n_head, preseqlen, match_n_embd)
         past_key_values = temp_control.permute([2, 0, 3, 1, 4]).split(2)
+        # 输出结构：（与 GPT-2 的 past_key_values 完全匹配）
+        #   假设 match_n_layer=2（简化为 2 层）、bsz=1、preseqlen=10、match_n_head=16、match_n_embd=64：
+        #     - past_key_values 是长度为 2 的元组：
+        #         (
+        #             (key_prompt_1, value_prompt_1),  # 第 1 层的 Prompt 键值对
+        #             (key_prompt_2, value_prompt_2)   # 第 2 层的 Prompt 键值对
+        #         )
+        #        其中每个 key_prompt_i 和 value_prompt_i 的形状为 (1, 16, 10, 64)，
+        #          与 GPT-2 对应层的 key/value 张量形状完全一致。
         return past_key_values
 
     def get_prompt_p3_infix(self, src, control_code=None, gpt2=None, bsz=None):
