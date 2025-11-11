@@ -42,10 +42,14 @@ class PrefixTuning(PretrainedBartModel):
                 - data2text
                 - dataless
         mode_para (int): [0, 1(dataless), 2(writingPrompts、webnlg、triples、data2text),3, 4]
-        wte (Embedding): 词嵌入层（Word Token Embedding）(权重嵌入?)
-        wte_enc (Embedding): encoder prefix 的权重嵌入
-        control_trans (Sequential): 控制转换，是一个 MLP
-
+        wte (Embedding): 自注意力场景的词嵌入层（Word Token Embedding）(权重嵌入?)
+        wte2 (Embedding): 交叉注意力场景的词嵌入层（Word Token Embedding）(权重嵌入?)
+        wte_enc (Embedding): 编码器的 Prompt 嵌入层（encoder prefix 的权重嵌入）
+        control_trans (Sequential): 特征转换模块：生成自注意力的 prompt 特征（是一个 MLP）
+        control_trans2 (Sequential): 特征转换模块：生成交叉注意力的 prompt 特征（是一个 MLP）
+        control_trans_enc (Sequential): 特征转换模块：生成编码器的 prompt 特征（是一个 MLP）
+        use_cross_prefix (bool): 是否启用交叉注意力 Prompt
+        use_encoder_prefix (bool): 是否启用编码器 Prompt
     """
 
     preseqlen: int = 5
@@ -69,8 +73,11 @@ class PrefixTuning(PretrainedBartModel):
     lowdata_token: Optional[str] = None
     mode_para: Literal[0, 1, 2, 3, 4] = 1
     wte: Embedding
+    wte2: Embedding
     wte_enc: Embedding
     control_trans: Sequential
+    control_trans2: Sequential
+    control_trans_enc: Sequential
     use_cross_prefix: bool
     use_encoder_prefix: bool = True
 
@@ -881,35 +888,82 @@ class PrefixTuning(PretrainedBartModel):
 
     def get_prompt_p5(self, control_code=None, gpt2=None, bsz=None, sample_size=1):
         """
-
+        用于 Prompt 生成
+        生成包含「自注意力缓存」、「交叉注意力缓存」等多类型结构的 Prompt 字典，
+          适配支持 encoder-decoder 结构或交叉注意力机制的模型（如某些基于 GPT-2 扩展的模型）。
+          其输出不仅包含与 GPT-2 past_key_values 兼容的键值对，还可根据配置添加交叉注意力、编码器相关的缓存，
+          适用于更复杂的条件生成场景（如文本摘要、翻译等需要编码器-解码器交互的任务）。
         Args:
             control_code:
             gpt2:
             bsz:
-            sample_size:
+            sample_size: 每个样本的采样数（用于计算扩展后的批次大小，如 sample_size=2 表示每个样本生成 2 个 Prompt）。
 
         Returns:
             返回「与 past_key_values 结构匹配的张量序列」：与 past_key_values 一致，或直接返回可拼接的张量列表。
 
+        Notes:
+            核心作用与适用场景：
+              复杂的 Prompt 生成方法，支持多类型注意力缓存，核心作用是：
+              - 适配复杂模型结构：不仅支持 GPT-2 式的自回归模型，
+                  还兼容带交叉注意力、编码器的模型（如 T5、BART 等 encoder-decoder 模型的变体）。
+              - 多维度控制：通过自注意力、交叉注意力、编码器缓存的分别设计，
+                  可从多个维度（解码器自身、解码器 - 编码器交互、编码器自身）引导模型生成。
+              - 批量采样支持：通过 sample_size 扩展批次，一次生成多个样本的 Prompt，
+                  适用于需要多样化输出的场景（如生成多个候选文本）。
+            适用场景包括：
+              - 文本摘要（需编码器理解输入，解码器生成摘要）
+              - 机器翻译（跨语言交叉注意力）
+              - 多候选生成（结合 sample_size 生成多个版本）等。
+            总结：
+              通过「基础自注意力 Prompt + 可选交叉注意力 Prompt + 可选编码器 Prompt」的组合，
+                生成结构化的多层缓存字典，适配复杂模型架构和多维度控制需求。
+                其设计灵活，通过 use_cross_prefix 和 use_encoder_prefix 开关可适配不同场景，是支持复杂条件生成任务的核心方法。
+                输出的字典结构可直接作为模型的 past_key_values 缓存使用，实现 Prompt 对模型生成过程的精细控制。
+
         """
         old_bsz = bsz
+        # 扩展后的批次大小：基础批次 × 采样数
         bsz = bsz * sample_size
+
+        # 1. 生成输入 token 并扩展批次
+        # self.input_tokens：预定义的 Prompt 输入 token（整数索引张量，作为生成 Prompt 的基础）
+        # 形状：[bsz, preseqlen]（preseqlen 是 self.input_tokens 的长度，即 Prompt 序列长）
         input_tokens = self.input_tokens.unsqueeze(0).expand(bsz, -1).to(self.device)
-        temp_control = self.wte(input_tokens)
+
+        # 2. 嵌入输入 token 为向量
+        # self.wte / self.wte2 / self.wte_enc：
+        #   不同场景的词嵌入层（分别用于自注意力、交叉注意力、编码器的 Prompt 嵌入）
+        temp_control = self.wte(input_tokens) # temp_control 形状：[bsz, preseqlen, emb_size]
+
+        # 3. 生成自注意力 Prompt 特征
+        # self.control_trans / self.control_trans2 / self.control_trans_enc：
+        #   对应的特征转换模块，生成不同类型的 Prompt 特征
         past_key_values = self.control_trans(temp_control)  # bsz, seqlen, layer*emb
         bsz, seqlen, _ = past_key_values.shape
+
+        # 4. 重塑为 5 维结构（与模型注意力缓存对齐）
+        # 形状：[bsz, preseqlen, layer×2, head, head_dim]
         past_key_values = past_key_values.view(
             bsz, seqlen, self.match_n_layer * 2, self.match_n_head, self.match_n_embd
         )
         past_key_values = self.dropout(past_key_values)
+
+        # 5. 按层拆分 (key, value)：生成自注意力机制所需的 Prompt 键值对（key_self/value_self）。
+        # 结果为：长度为 match_n_layer 的元组，每层是 (key_self, value_self) 二元组
         past_key_values = past_key_values.permute([2, 0, 3, 1, 4]).split(2)
 
+        # 是否启用交叉注意力 Prompt
         if self.use_cross_prefix:
-            temp_control2 = self.wte2(input_tokens)
-            past_key_values2 = self.control_trans2(
-                temp_control2
-            )  # bsz, seqlen, layer*emb
+            # 1. 用另一嵌入层生成输入 token 的向量
+            temp_control2 = self.wte2(input_tokens) # 形状：[bsz, preseqlen, emb_size]
+
+            # 2. 生成交叉注意力 Prompt 特征
+            # 形状：bsz, seqlen, layer * emb
+            past_key_values2 = self.control_trans2(temp_control2)
             bsz, seqlen, _ = past_key_values2.shape
+            # self.match_n_layer / self.match_n_head / self.match_n_embd：
+            #   与模型匹配的层数、注意力头数、头维度
             past_key_values2 = past_key_values2.view(
                 bsz,
                 seqlen,
@@ -918,16 +972,27 @@ class PrefixTuning(PretrainedBartModel):
                 self.match_n_embd,
             )
             past_key_values2 = self.dropout(past_key_values2)
+            # 结果：每层是 (key_cross, value_cross) 二元组（交叉注意力键值对）
             past_key_values2 = past_key_values2.permute([2, 0, 3, 1, 4]).split(2)
 
+        # 是否启用编码器 Prompt
         if self.use_encoder_prefix:
+            # 1. 生成编码器输入 token（批次为原始批次 old_bsz，非扩展后的 bsz）
+            # 形状：[old_bsz, preseqlen]
             input_tokens_enc = (
                 self.input_tokens.unsqueeze(0).expand(old_bsz, -1).to(self.device)
             )
+
+            # 2. 编码器嵌入层转换
+            # 形状：[old_bsz, preseqlen, emb_size]
             temp_control_enc = self.wte_enc(input_tokens_enc)
+
+            # 3. 生成编码器 Prompt 特征：
+            #    编码器 Prompt 用于增强编码器对输入的理解，批次大小为原始 old_bsz（与编码器输入批次一致）
+            # 形状：bsz, seqlen, layer * emb （批次是 bsz 吗？） [old_bsz, preseqlen, layer*emb]
             past_key_values_enc = self.control_trans_enc(
                 temp_control_enc
-            )  # bsz, seqlen, layer*emb
+            )
             bsz_enc, seqlen, _ = past_key_values_enc.shape
             past_key_values_enc = past_key_values_enc.view(
                 bsz_enc,
@@ -937,39 +1002,49 @@ class PrefixTuning(PretrainedBartModel):
                 self.match_n_embd,
             )
             past_key_values_enc = self.dropout(past_key_values_enc)
+
+            # 结果：每层是 (key_enc, value_enc) 二元组（编码器自注意力键值对）
             past_key_values_enc = past_key_values_enc.permute([2, 0, 3, 1, 4]).split(2)
 
+        # 组装最终结果（多层字典结构）
+        # result 是长度为 match_n_layer 的列表，每个元素是一个字典，包含对应层的注意力缓存：
         result = []
         for i, key_val in enumerate(past_key_values):
+            # 1. 组装自注意力缓存字典
             temp_dict = {
-                "self": {
-                    "prev_key": key_val[0].contiguous(),
-                    "prev_value": key_val[1].contiguous(),
+                "self": { # 自注意力相关缓存
+                    "prev_key": key_val[0].contiguous(),   # key_self（确保内存连续）
+                    "prev_value": key_val[1].contiguous(), # value_self
+                    # 注意力掩码（全 False 表示无 padding）
                     "prev_key_padding_mask": torch.zeros(bsz, seqlen)
                     .to(key_val.device)
                     .bool(),
                     # bsz, preseqlen
                 },
             }
+
+            # 2. 若启用交叉注意力，添加交叉缓存
             if self.use_cross_prefix:
                 key_val2 = past_key_values2[i]
-                temp_dict["encoder_decoder"] = {
-                    "prev_key": key_val2[0].contiguous(),
-                    "prev_value": key_val2[1].contiguous(),
+                temp_dict["encoder_decoder"] = { # 交叉注意力相关缓存
+                    "prev_key": key_val2[0].contiguous(),   # key_cross
+                    "prev_value": key_val2[1].contiguous(), # value_cross
                     "prev_key_padding_mask": torch.zeros(bsz, seqlen)
                     .to(key_val2.device)
                     .bool(),
                 }
+
+            # 3. 若启用编码器，添加编码器缓存
             if self.use_encoder_prefix:
                 key_val_enc = past_key_values_enc[i]
-                temp_dict["encoder"] = {
-                    "prev_key": key_val_enc[0].contiguous(),
-                    "prev_value": key_val_enc[1].contiguous(),
+                temp_dict["encoder"] = { # 编码器自注意力相关缓存
+                    "prev_key": key_val_enc[0].contiguous(),   # key_enc
+                    "prev_value": key_val_enc[1].contiguous(), # value_enc
                     "prev_key_padding_mask": torch.zeros(bsz_enc, seqlen)
                     .to(key_val_enc.device)
                     .bool(),
                 }
-            result.append(temp_dict)
+            result.append(temp_dict) # 按层添加到结果列表
 
         return result
 
