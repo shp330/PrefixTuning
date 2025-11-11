@@ -9,7 +9,7 @@ from transformers import (
     PretrainedBartModel,
 )
 from torch import nn, Tensor
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 
 
 class PrefixTuning(PretrainedBartModel):
@@ -718,30 +718,99 @@ class PrefixTuning(PretrainedBartModel):
         #          与 GPT-2 对应层的 key/value 张量形状完全一致。
         return past_key_values
 
-    def get_prompt_p3_infix(self, src, control_code=None, gpt2=None, bsz=None):
+    def get_prompt_p3_infix(
+        self, src: Tensor, control_code=None, gpt2=None, bsz=None
+    ) -> List[Tensor]:
+        """
+        生成「插入式（infix）Prompt」
+        核心逻辑是：将经过 GPT-2 编码后的输入文本 src 的特征与 control_trans 模块生成的 Prompt 特征拼接，
+          形成扩展的注意力缓存键值对（past_key_values）。
+        适用于在原有文本特征中间插入自定义 Prompt 的场景（如文本编辑、条件生成等）。
+
+        Args:
+            src: 输入文本的 token id
+            control_code:
+            gpt2:
+            bsz: 批次大小
+
+        Returns:
+            List[Tensor]: 输入与promt拼接后的Tensor的列表
+
+        Notes:
+            - elf.control_trans：
+                用于生成 Prompt 特征的模块（输入 src_repr，输出与 GPT-2 注意力缓存兼容的特征）。
+            - self.match_n_layer / self.match_n_head / self.match_n_embd：
+                与 GPT-2 匹配的层数、注意力头数、每个头的维度（确保 Prompt 与模型结构兼容）。
+            - self.dropout：dropout 层（防止过拟合）。
+
+            「infix」意为「插入式」，指该方法生成的 Prompt 不是独立于输入文本的，
+               而是与输入文本的特征拼接融合，形成扩展的注意力缓存。
+            这种设计适用于：
+                - 文本编辑：在原有文本中间插入 Prompt 引导修改（如改写句子、补充内容）。
+                - 条件生成：基于输入文本的语义特征生成相关 Prompt，使输出更贴合输入上下文。
+                - 特征增强：通过 control_trans 学习输入文本的模式，生成互补的 Prompt 特征，提升模型对输入的理解。
+            总结
+                get_prompt_p3_infix 的核心逻辑是「输入编码→特征生成→维度对齐→拼接融合」，
+                  最终输出包含输入文本与 Prompt 联合特征的注意力缓存。
+                与 【get_prompt_p2】 相比，它更强调 Prompt 与输入文本的语义关联（通过 src_repr 驱动 control_trans 生成 Prompt），
+                  适用于需要结合输入内容动态生成 Prompt 的场景
+        """
+
         # temp_result = gpt2(inputs_embeds=input_embs, use_cache=True, return_dict=True)
         # print('infix')
+        # 将输入文本的 token id 传入 GPT-2，获取编码后的特征。
+        # - use_cache=True：返回 past_key_values（输入文本的注意力缓存键值对，用于后续拼接）。
+        # - output_hidden_states=True：返回所有层的隐藏态（用于提取输入文本的高层语义特征）。
         src_out = gpt2(
             input_ids=src, use_cache=True, return_dict=True, output_hidden_states=True
         )
-        src_repr = src_out.hidden_states[-1]  # bsz, seqlen, hidden
+
+        # src_out 包含的核心字段：
+        # - hidden_states：所有层的隐藏态（列表）：
+        #     - hidden_states[-1] ：最后一层的输出（高层语义特征），作为输入文本的语义表示（src_repr）。
+        # - past_key_values：输入文本的注意力缓存（嵌套二元组，形状与之前解析的一致）。
+        src_repr = src_out.hidden_states[-1]  # 形状：[bsz, src_seqlen, hidden_size]
+
+        # src_past_key_vals：输入文本 src 经过 GPT-2 各层后的注意力键值对
+        #   嵌套二元组，每层为 (key_src, value_src)
         src_past_key_vals = src_out.past_key_values
-        past_key_values = self.control_trans(src_repr)  # bsz, seqlen, layer*emb
+
+        # control_trans 模块，生成 Prompt 的原始特征（past_key_values），此时形状为： [bsz, src_seqlen, layer * emb]
+        #   layer * emb 是 match_n_layer × 2 × match_n_head × match_n_embd 的扁平化维度。
+        # 将输入文本的语义特征 src_repr 传入
+        past_key_values = self.control_trans(src_repr)  # [bsz, src_seqlen, layer * emb]
 
         bsz, seqlen, _ = past_key_values.shape
-        # print(past_key_values.shape)
+
+        # 将 control_trans 输出的扁平特征重塑为与 get_prompt_p2 一致，目的是与 GPT-2 的 key/value 张量维度对齐。
         past_key_values = past_key_values.view(
             bsz, seqlen, self.match_n_layer * 2, self.match_n_head, self.match_n_embd
         )
-        past_key_values = self.dropout(past_key_values)
+        past_key_values = self.dropout(past_key_values)  # 随机失活，防止过拟合
+
+        # permute：形状调整为[match_n_layer * 2, bsz, match_n_head, seqlen, match_n_embd]，
+        #            与 GPT-2 的 key/value 维度顺序一致
+        # split(2)：按层数拆分，得到长度为 match_n_layer 的元组，
+        #            每个元素是 (key_prompt, value_prompt) 二元组（Prompt 的键值对）。
         past_key_values = past_key_values.permute([2, 0, 3, 1, 4]).split(2)
 
+        # 拼接输入文本特征与 Prompt 特征
+        # 将输入文本的注意力键值对与 Prompt 的键值对沿序列长度维度（dim=3）拼接。
+        # full_lst 是长度为 match_n_layer 的元组
         full_lst = []
         for i in range(len(src_past_key_vals)):
             full_lst.append(
                 torch.cat([src_past_key_vals[i], past_key_values[i]], dim=3)
             )
-
+        # 输出结构（拼接后的注意力缓存）
+        #   假设 GPT-2 为 2 层（match_n_layer=2），bsz=1，src_seqlen=5，match_n_head=16，match_n_embd=64：
+        #   full_lst 是长度为 2 的元组：
+        #     (
+        #         (key_full_1, value_full_1),  # 第 1 层拼接后的键值对
+        #         (key_full_2, value_full_2)   # 第 2 层拼接后的键值对
+        #     )
+        #   每个 key_full_i 和 value_full_i 的形状为 (1, 16, 10, 64)（5 + 5 = 10，序列长度翻倍），
+        #     包含输入文本和 Prompt 的联合特征。
         return full_lst
 
     def get_prompt_p3(self, control_code, gpt2=None, bsz=None):
