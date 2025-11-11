@@ -50,6 +50,10 @@ class PrefixTuning(PretrainedBartModel):
         control_trans_enc (Sequential): 特征转换模块：生成编码器的 prompt 特征（是一个 MLP）
         use_cross_prefix (bool): 是否启用交叉注意力 Prompt
         use_encoder_prefix (bool): 是否启用编码器 Prompt
+        input_embs (Tensor): 预定义的 Prompt 嵌入向量（形状 [1, preseqlen, emb_size] 或 [preseqlen, emb_size]），
+            无需通过词嵌入层转换，直接作为输入。
+            是提前定义好的嵌入向量（而非离散 token 索引），可能是随机初始化后可训练的参数，
+              或通过其他方式预优化的向量（如从预训练模型中提取的特征）。
     """
 
     preseqlen: int = 5
@@ -80,6 +84,7 @@ class PrefixTuning(PretrainedBartModel):
     control_trans_enc: Sequential
     use_cross_prefix: bool
     use_encoder_prefix: bool = True
+    input_embs: Tensor
 
     def __init__(
         self,
@@ -934,7 +939,9 @@ class PrefixTuning(PretrainedBartModel):
         # 2. 嵌入输入 token 为向量
         # self.wte / self.wte2 / self.wte_enc：
         #   不同场景的词嵌入层（分别用于自注意力、交叉注意力、编码器的 Prompt 嵌入）
-        temp_control = self.wte(input_tokens) # temp_control 形状：[bsz, preseqlen, emb_size]
+        temp_control = self.wte(
+            input_tokens
+        )  # temp_control 形状：[bsz, preseqlen, emb_size]
 
         # 3. 生成自注意力 Prompt 特征
         # self.control_trans / self.control_trans2 / self.control_trans_enc：
@@ -956,7 +963,7 @@ class PrefixTuning(PretrainedBartModel):
         # 是否启用交叉注意力 Prompt
         if self.use_cross_prefix:
             # 1. 用另一嵌入层生成输入 token 的向量
-            temp_control2 = self.wte2(input_tokens) # 形状：[bsz, preseqlen, emb_size]
+            temp_control2 = self.wte2(input_tokens)  # 形状：[bsz, preseqlen, emb_size]
 
             # 2. 生成交叉注意力 Prompt 特征
             # 形状：bsz, seqlen, layer * emb
@@ -990,9 +997,7 @@ class PrefixTuning(PretrainedBartModel):
             # 3. 生成编码器 Prompt 特征：
             #    编码器 Prompt 用于增强编码器对输入的理解，批次大小为原始 old_bsz（与编码器输入批次一致）
             # 形状：bsz, seqlen, layer * emb （批次是 bsz 吗？） [old_bsz, preseqlen, layer*emb]
-            past_key_values_enc = self.control_trans_enc(
-                temp_control_enc
-            )
+            past_key_values_enc = self.control_trans_enc(temp_control_enc)
             bsz_enc, seqlen, _ = past_key_values_enc.shape
             past_key_values_enc = past_key_values_enc.view(
                 bsz_enc,
@@ -1012,9 +1017,9 @@ class PrefixTuning(PretrainedBartModel):
         for i, key_val in enumerate(past_key_values):
             # 1. 组装自注意力缓存字典
             temp_dict = {
-                "self": { # 自注意力相关缓存
-                    "prev_key": key_val[0].contiguous(),   # key_self（确保内存连续）
-                    "prev_value": key_val[1].contiguous(), # value_self
+                "self": {  # 自注意力相关缓存
+                    "prev_key": key_val[0].contiguous(),  # key_self（确保内存连续）
+                    "prev_value": key_val[1].contiguous(),  # value_self
                     # 注意力掩码（全 False 表示无 padding）
                     "prev_key_padding_mask": torch.zeros(bsz, seqlen)
                     .to(key_val.device)
@@ -1026,9 +1031,9 @@ class PrefixTuning(PretrainedBartModel):
             # 2. 若启用交叉注意力，添加交叉缓存
             if self.use_cross_prefix:
                 key_val2 = past_key_values2[i]
-                temp_dict["encoder_decoder"] = { # 交叉注意力相关缓存
-                    "prev_key": key_val2[0].contiguous(),   # key_cross
-                    "prev_value": key_val2[1].contiguous(), # value_cross
+                temp_dict["encoder_decoder"] = {  # 交叉注意力相关缓存
+                    "prev_key": key_val2[0].contiguous(),  # key_cross
+                    "prev_value": key_val2[1].contiguous(),  # value_cross
                     "prev_key_padding_mask": torch.zeros(bsz, seqlen)
                     .to(key_val2.device)
                     .bool(),
@@ -1037,22 +1042,51 @@ class PrefixTuning(PretrainedBartModel):
             # 3. 若启用编码器，添加编码器缓存
             if self.use_encoder_prefix:
                 key_val_enc = past_key_values_enc[i]
-                temp_dict["encoder"] = { # 编码器自注意力相关缓存
-                    "prev_key": key_val_enc[0].contiguous(),   # key_enc
-                    "prev_value": key_val_enc[1].contiguous(), # value_enc
+                temp_dict["encoder"] = {  # 编码器自注意力相关缓存
+                    "prev_key": key_val_enc[0].contiguous(),  # key_enc
+                    "prev_value": key_val_enc[1].contiguous(),  # value_enc
                     "prev_key_padding_mask": torch.zeros(bsz_enc, seqlen)
                     .to(key_val_enc.device)
                     .bool(),
                 }
-            result.append(temp_dict) # 按层添加到结果列表
+            result.append(temp_dict)  # 按层添加到结果列表
 
         return result
 
     def get_prompt_p6(self, control_code=None, gpt2=None, bsz=None):
+        """
+        适用场景：
+           - Prompt 嵌入预优化：若 self.input_embs 是通过其他方式（如无监督学习、迁移学习）预优化的向量，
+               可直接用于生成高质量 Prompt，避免从头训练嵌入层。
+           - 轻量 Prompt 微调：结构简洁，仅通过 control_trans 调整特征，适合模型资源有限、需要快速训练的场景。
+        Args:
+            control_code:
+            gpt2:
+            bsz:
+
+        Returns:
+
+        Notes:
+            与其他 Prompt 生成方法的对比（核心差异）
+              - get_prompt_p2	输入：离散 token（需 view 重塑）；
+                                特点：无嵌入层，直接重塑参数；
+                                场景：简单 Prompt 初始化
+              - get_prompt_p3	输入：控制码 control_code；
+                                特点：需词嵌入层（wte），支持条件控制；
+                                场景：可控生成（风格、任务引导）
+              - get_prompt_p5	输入：离散 token + 多模块；
+                                特点：支持自注意力 / 交叉注意力 / 编码器缓存；
+                                场景：encoder-decoder 模型、多维度控制
+              - get_prompt_p6	输入：预定义嵌入 input_embs；
+                                特点：无词嵌入层，简洁高效，直接扩展批次；
+                                场景：已优化嵌入的 Prompt、批量生成
+
+        """
         input_embs = self.input_embs.to(self.device)
-        past_key_values = self.control_trans(input_embs).expand(
-            bsz, -1, -1
-        )  # bsz, seqlen, layer*emb
+        # 输出形状：[bsz, preseqlen, layer*emb]
+        # 将预定义嵌入 input_embs 传入转换模块，生成扁平化的 Prompt 特征
+        #   （layer * emb 是 match_n_layer * 2 * match_n_head * match_n_embd 的乘积，即所有层键值对的扁平化维度）。
+        past_key_values = self.control_trans(input_embs).expand(bsz, -1, -1)
         bsz, seqlen, _ = past_key_values.shape
         past_key_values = past_key_values.view(
             bsz, seqlen, self.match_n_layer * 2, self.match_n_head, self.match_n_embd
