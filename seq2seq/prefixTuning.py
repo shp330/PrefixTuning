@@ -9,7 +9,7 @@ from transformers import (
     PretrainedBartModel,
 )
 from torch import nn, Tensor
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Tuple
 
 
 class PrefixTuning(PretrainedBartModel):
@@ -42,7 +42,7 @@ class PrefixTuning(PretrainedBartModel):
                 - data2text
                 - dataless
         mode_para (int): [0, 1(dataless), 2(writingPrompts、webnlg、triples、data2text),3, 4]
-        wte (Embedding): 权重嵌入
+        wte (Embedding): 词嵌入层（Word Token Embedding）(权重嵌入?)
         wte_enc (Embedding): encoder prefix 的权重嵌入
         control_trans (Sequential): 控制转换，是一个 MLP
 
@@ -813,18 +813,59 @@ class PrefixTuning(PretrainedBartModel):
         #     包含输入文本和 Prompt 的联合特征。
         return full_lst
 
-    def get_prompt_p3(self, control_code, gpt2=None, bsz=None):
+    def get_prompt_p3(
+        self, control_code, gpt2=None, bsz=None
+    ) -> Tuple[Tuple[Tensor, Tensor]]:
+        """
+        基于控制码（control_code）生成结构化 Prompt
+        将用户输入的 control_code（控制信号，通常是离散的标签或指令编码）通过词嵌入层（wte）转换为向量，
+          再经 control_trans 模块处理，最终生成与 GPT-2 模型 past_key_values 结构匹配的 Prompt 键值对。
+        适用于条件生成场景（如根据不同控制指令生成特定风格 / 内容的文本）。
+        Args:
+            control_code:
+            gpt2:
+            bsz:
+
+        Returns:
+            Tuple[Tuple[Tensor, Tensor]]: 元组的元组，元素为(key, value)
+
+        Notes:
+            作用: 条件 Prompt 生成
+              该方法的核心是将离散的控制信号（control_code）转换为与 GPT-2 兼容的结构化 Prompt，
+                实现「控制码 → Prompt → 模型输出」的条件生成链路，
+            适用于：
+              - 风格控制：用 control_code 表示风格标签（如「正式」「幽默」），生成对应风格的文本。
+              - 任务引导：用 control_code 表示任务指令（如「翻译」「摘要」），引导模型执行特定任务。
+              - 领域适配：用 control_code 表示领域标签（如「医疗」「法律」），使生成内容贴合特定领域。
+            总结
+              get_prompt_p3 通过「控制码嵌入 → 特征转换 → 维度对齐」的流程，生成由 control_code 驱动的结构化 Prompt，
+                其输出与 GPT-2 的 past_key_values 完全兼容，可直接用于条件生成或微调。
+              与 get_prompt_p2（无外部条件）、get_prompt_p3_infix（基于输入文本）相比，
+                它更强调外部控制信号对 Prompt 的直接引导，是实现可控生成的重要工具。
+
+        """
+        # - self.wte 可选的词嵌入层（Word Token Embedding），
+        #   用于将 control_code 转换为向量（若为 None，则使用 GPT-2 自带的 wte）
+        # - control_code：控制码张量（形状 [bsz, control_seqlen]），
+        #   是生成 Prompt 的条件信号（如标签、指令的 input_ids），不可为 None（否则触发断言错误）。
+        # !!! IFNO !!! 将离散的 control_code（整数索引）通过词嵌入层转换为连续向量 temp_control，捕捉控制码的语义信息。
         if control_code is not None:
             if self.wte:
                 temp_control = self.wte(control_code)
             else:
                 assert gpt2 is not None
+                # 使用 GPT-2 自带词嵌入
+                #   形状为：[bsz, control_seqlen, emb_size]（emb_size 为 GPT-2 隐藏层维度，如 1024）
                 temp_control = gpt2.transformer.wte(control_code)  # bsz, seqlen, emb
             # need to handle padding? use attention mask.
-            # print(temp_control.shape)
+            # self.control_trans：输入嵌入向量，输出与 GPT-2 注意力缓存兼容的特征。
+            # control_trans 模块对嵌入向量 temp_control 进行处理，输出扁平化的 Prompt 特征。
+            # 维度说明：layer * emb 是 match_n_layer * 2 * match_n_head * match_n_embd 的乘积（扁平化的键值对特征）。
             past_key_values = self.control_trans(temp_control)  # bsz, seqlen, layer*emb
             bsz, seqlen, _ = past_key_values.shape
-            # print(past_key_values.shape)
+
+            # self.match_n_layer / self.match_n_head / self.match_n_embd：
+            #   与 GPT-2 匹配的层数、注意力头数、头维度（确保 Prompt 结构兼容）。
             past_key_values = past_key_values.view(
                 bsz,
                 seqlen,
