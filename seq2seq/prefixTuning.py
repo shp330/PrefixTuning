@@ -1096,18 +1096,61 @@ class PrefixTuning(PretrainedBartModel):
         return past_key_values
 
     def get_prompt_p4(self, control_code, gpt2=None, bsz=None):
+        """
+        基于控制码（control_code）的 Prompt 生成
+        对 control_trans 输出的特征做「序列维度均值池化」—— 通过 mean(1).unsqueeze(1) 压缩控制码的序列信息，
+          生成「固定长度为 1」的 Prompt 特征，适用于控制码序列长度不固定，
+          但希望 Prompt 长度统一的场景（如用变长标签作为控制信号，生成固定长度的引导 Prompt）。
+        Args:
+            control_code:
+            gpt2:
+            bsz:
+
+        Returns:
+
+        Notes:
+            设计核心是「用均值池化统一 Prompt 长度」
+            适用于以下场景：
+              - 控制码序列长度不固定：例如控制码是不同长度的标签（如 “正面”“非常正面”“极度正面”），
+                通过均值池化将其压缩为固定长度 1 的 Prompt，避免批次处理时的维度不匹配。
+              - 无需依赖控制码序列顺序：当控制码的核心信息是 “类别” 而非 “顺序”（如情感标签、领域标签），
+                均值池化能概括整体语义，且简化 Prompt 结构。
+              - 轻量化 Prompt 需求：固定长度为 1 的 Prompt 计算开销更小，适合对模型效率有要求的场景。
+            不适用场景：
+              控制码的序列顺序对 Prompt 生成至关重要（如指令类控制码 “先描述场景，再生成结论”），
+                此时均值池化会丢失顺序信息，应使用 get_prompt_p3。
+            总结:
+              get_prompt_p4 是 get_prompt_p3 的「长度统一版」，
+              核心通过 mean(1).unsqueeze(1) 对控制码特征做均值池化，将 Prompt 序列长度固定为 1。
+              它继承了 get_p3 「控制码驱动 Prompt 生成」的逻辑，同时解决了控制码序列长度不一致的问题，
+              是兼顾灵活性和统一性的轻量化设计，适用于「类别型、变长控制码」的场景。
+
+        """
         # print(control_code, control_code.shape)
         if control_code is not None:
             if self.wte:
+                # 自定义嵌入：[bsz, control_seqlen, emb_size]
+                # control_seqlen 是控制码的序列长度（可能不固定，如不同标签长度不同）
+                # temp_control 形状：[bsz, control_seqlen, emb_size]（批次、控制码长度、嵌入维度）。
                 temp_control = self.wte(control_code)
             else:
                 assert gpt2 is not None
                 temp_control = gpt2.transformer.wte(control_code)  # bsz, seqlen, emb
             # need to handle padding? use attention mask.
             # print(temp_control.shape)
+            #
+            # - self.control_trans(temp_control) → 形状：[bsz, control_seqlen, layer*emb]
+            #     （layer * emb = match_n_layer * 2 * match_n_head * match_n_embd，扁平化特征）
+            #
+            # - mean(1) → 对「第 1 维（control_seqlen）」求均值，形状：[bsz, layer * emb]
+            #      作用：压缩控制码的序列维度，用均值代表整个控制码序列的特征（长度从 control_seqlen → 1）
+            #      目的：统一 Prompt 长度，避免因控制码序列长度不一致导致的批次处理问题，
+            #           同时用均值概括控制码的整体语义（不依赖具体序列顺序）。
+            # - unsqueeze(1) → 在「第 1 维」插入一个维度，形状：[bsz, 1, layer*emb]
+            #      作用：恢复序列维度（长度为 1），与后续 reshape 要求的维度匹配
             past_key_values = (
                 self.control_trans(temp_control).mean(1).unsqueeze(1)
-            )  # bsz, seqlen, layer*emb
+            )  # bsz, seqlen, layer * emb
             bsz, seqlen, _ = past_key_values.shape
             # print(past_key_values.shape)
             past_key_values = past_key_values.view(
