@@ -1188,6 +1188,13 @@ class PrefixTuning(PretrainedBartModel):
             - self.match_n_layer/self.match_n_head/self.match_n_embd：与 GPT-2 匹配的结构参数（层数、头数、头维度）。
             - control_code：必选控制码（非元组时为 input_ids 张量或嵌入向量，元组类型已禁用）；
 
+            求和池化（sum(1)）的特点
+            与均值池化（mean(1)）的区别：求和保留了特征的「总强度」（控制码越长、元素值越大，和越大），均值则归一化了长度影响；
+            适用场景：当控制码的「语义强度」需要影响 Prompt 特征时（如强控制信号对应强 Prompt 特征），求和池化更合适。
+
+             方法	       计算逻辑	                 特点（影响）	                          适用场景
+          sum(dim=1)	序列维度元素求和	   保留长度影响（长序列和更大），体现强度	    控制码长度相近，需保留语义强度
+          mean(dim=1)	序列维度元素求均值	   抵消长度影响（长 / 短序列均值范围一致）	控制码长度差异大，需统一尺度
         Returns:
 
 
