@@ -50,6 +50,7 @@ class PrefixTuning(PretrainedBartModel):
         control_trans_enc (Sequential): 特征转换模块：生成编码器的 prompt 特征（是一个 MLP）
         use_cross_prefix (bool): 是否启用交叉注意力 Prompt
         use_encoder_prefix (bool): 是否启用编码器 Prompt
+        embMatch (bool): 是否直接使用 control_code 作为嵌入，True 则跳过词嵌入步骤
         input_embs (Tensor): 预定义的 Prompt 嵌入向量（形状 [1, preseqlen, emb_size] 或 [preseqlen, emb_size]），
             无需通过词嵌入层转换，直接作为输入。
             是提前定义好的嵌入向量（而非离散 token 索引），可能是随机初始化后可训练的参数，
@@ -85,6 +86,7 @@ class PrefixTuning(PretrainedBartModel):
     use_cross_prefix: bool
     use_encoder_prefix: bool = True
     input_embs: Tensor
+    embMatch: bool
 
     def __init__(
         self,
@@ -1168,9 +1170,32 @@ class PrefixTuning(PretrainedBartModel):
         return past_key_values
 
     def get_prompt_p1(self, control_code, gpt2=None, bsz=None):
-        if control_code is not None:
+        """
+        支持多输入类型、基于控制码的 Prompt 生成方法; 适用于需要用控制码生成固定长度 Prompt 的场景。
+        - 区分 control_code 类型（元组 / 非元组），但元组类型已被断言禁用；
+        - 非元组场景下，根据 self.embMatch 开关，分「词嵌入 + 求和池化」和「直接使用输入嵌入」两种逻辑；
+        - 关键操作是 sum(1).unsqueeze(1) 求和池化（而非 p4 的均值池化），
+            且最终会将 Prompt 序列长度扩展为 seq_pastlen × self.preseqlen（固定长度）。
+        Args:
+            control_code:
+            gpt2:
+            bsz:
+        Notes:
+            - self.embMatch (bool)：是否直接使用 control_code 作为嵌入，True 则跳过词嵌入步骤
+            - self.wte/gpt2.transformer.wte：词嵌入层（embMatch=False 时用于将离散控制码转为向量）；
+            - self.control_trans：特征转换模块（生成与 GPT-2 兼容的扁平化特征）；
+            - self.preseqlen：Prompt 的目标序列长度（最终会扩展为该长度）；
+            - self.match_n_layer/self.match_n_head/self.match_n_embd：与 GPT-2 匹配的结构参数（层数、头数、头维度）。
+            - control_code：必选控制码（非元组时为 input_ids 张量或嵌入向量，元组类型已禁用）；
 
-            if type(control_code) is tuple:
+        Returns:
+
+
+
+        """
+
+        if control_code is not None:
+            if type(control_code) is tuple:  # 直接触发断言错误，禁用元组输入
                 assert False, "Tuples"
                 control_embs, control_word = control_code
                 past_key_values = self.control_trans(control_embs)
@@ -1185,35 +1210,59 @@ class PrefixTuning(PretrainedBartModel):
                 )
                 past_key_values = past_key_values.permute([2, 0, 3, 1, 4]).split(2)
                 print(control_word, control_embs.shape)
-            else:
+            else:  # control_code 非元组
                 # print('running with control code')
                 # use the control code to generate the first 5 activation layers.
-                if not self.embMatch:
+                if (
+                    not self.embMatch
+                ):  # 适用于 control_code 是离散 input_ids（整数索引张量）的场景：
+                    # 1. 控制码转为词嵌入
                     if self.wte:
-                        temp_control = self.wte(control_code)
+                        temp_control = self.wte(
+                            control_code
+                        )  # 自定义词嵌入：[bsz, control_seqlen, emb_size]
                     else:
                         assert gpt2 is not None
-                        temp_control = gpt2.transformer.wte(control_code)
+                        temp_control = gpt2.transformer.wte(
+                            control_code
+                        )  # GPT-2 词嵌入：形状同上
+                    # 2. 求和池化（压缩序列维度）
+                    # a. sum(1)：对第1维（control_seqlen，控制码序列长度）求和 → 形状：[bsz, emb_size]
+                    # b. unsqueeze(1)：插入第1维 → 形状：[bsz, 1, emb_size]（恢复序列维度，长度为1）
+                    # 核心：用「求和」概括控制码的全局语义（区别于 p4 的均值，求和保留了特征强度）
                     temp_control = temp_control.sum(1).unsqueeze(1)
-                else:
-                    temp_control = control_code
+                else:  # 直接使用输入的嵌入向量，适用于 control_code 已提前转为嵌入向量（无需词嵌入）的场景
+                    # 注：此处未做求和池化，直接将原始嵌入传入后续模块
+                    temp_control = control_code  # 形状：[bsz, control_seqlen, emb_size]
                     # print(control_code.shape)
+
+                # 3. 特征转换（生成扁平化 Prompt 特征）
+                # - 子逻辑A：[bsz, 1, layer*emb]（layer*emb = match_n_layer×2×match_n_head×match_n_embd）
+                # - 子逻辑B：[bsz, control_seqlen, layer*emb]（若 control_seqlen≠1，后续求和会压缩为1）
                 past_key_values = self.control_trans(temp_control)
                 # print(past_key_values.shape) #bsz, controlCodeLen, long... 5 * config.n_layer * 2 * config.n_embd
+
+                # 4. 求和池化（统一序列长度为1）
+                # 形状：[bsz, 1, layer*emb]（无论输入序列长度多少，压缩为1）
                 past_key_values = past_key_values.sum(1).unsqueeze(1)
                 # print(past_key_values.shape)  # bsz, 1, long...
                 bsz, seq_pastlen, _ = past_key_values.shape
+
+                # 形状：[bsz, self.preseqlen, match_n_layer×2, match_n_head, match_n_embd]
                 past_key_values = past_key_values.view(
                     bsz,
+                    # 1 × self.preseqlen → 固定为 self.preseqlen
                     seq_pastlen * self.preseqlen,
                     self.match_n_layer * 2,
                     self.match_n_head,
                     self.match_n_embd,
                 )
+
+                # 6. 维度调整 + 拆分层（与 GPT-2 past_key_values 对齐）
+                # 结果：长度为 match_n_layer 的元组，每层是 (key_prompt, value_prompt) 二元组
                 past_key_values = past_key_values.permute([2, 0, 3, 1, 4]).split(2)
         else:
             assert False, "control_code is None"
-            past_key_values = None
         return past_key_values
 
     def forward(
