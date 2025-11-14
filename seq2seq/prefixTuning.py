@@ -41,7 +41,12 @@ class PrefixTuning(PretrainedBartModel):
                 - triples
                 - data2text
                 - dataless
-        mode_para (int): [0, 1(dataless), 2(writingPrompts、webnlg、triples、data2text),3, 4]
+        mode_para (int): 运行模式开关参数 [0, 1, 2(writingPrompts、webnlg、triples、data2text),3, 4]
+            - 0: for data2text Instruction based, just optimize a set of parameters （self.mode_para=0 and optim_prefix == True for Instruction based.）
+            - 1: for dataless
+            - 2：data2text having a variable length input prefix parametrization. or for (4) topic
+            - 3: OLD VERSION: many parameters.
+            - 4：topic/keyword/attributes..
         wte (Embedding): 自注意力场景的词嵌入层（Word Token Embedding）(权重嵌入?)
         wte2 (Embedding): 交叉注意力场景的词嵌入层（Word Token Embedding）(权重嵌入?)
         wte_enc (Embedding): 编码器的 Prompt 嵌入层（encoder prefix 的权重嵌入）
@@ -1295,17 +1300,68 @@ class PrefixTuning(PretrainedBartModel):
         tgt_attn=None,
         **kwargs,
     ):
+        """
+        核心是「Prompt 缓存注入」：通过自定义的 get_prompt 方法生成与 GPT-2 兼容的 Prompt 注意力缓存（past_key_values_prompt），
+          将其作为 GPT-2 的初始注意力缓存（past_key_values）传入模型，实现 Prompt 对生成过程的引导。
+
+        Prompt Tuning（提示调优）的核心实现，适用于：
+          - 低资源微调：无需微调 GPT-2 全部参数，仅训练 get_prompt 相关模块（如 control_trans、wte），降低计算成本；
+          - 可控生成：通过 get_prompt 生成不同 Prompt（如 p3 的控制码驱动、p5 的多类型注意力缓存），引导模型生成特定风格 / 内容的文本；
+          - 多场景适配：通过切换 self.get_prompt 方法（如 p1 求和池化、p6 预定义嵌入），适配不同控制码类型、Prompt 长度需求。
+
+        与原生 GPT-2 前向传播的区别：
+               对比维度	        原生 GPT-2 前向传播	                     本方法前向传播
+          past_key_values	  默认为 None（无初始缓存）	           强制使用 Prompt 生成的初始缓存
+          核心控制逻辑	      无 Prompt 引导，仅依赖 input_ids	   Prompt 驱动，可灵活切换 Prompt 类型
+          适用场景	          通用生成	                           可控生成、低资源微调
+
+        Args:
+            input_ids: 模型输入的 token 索引张量（形状 [bsz, seqlen]），必选（用于推断批次大小 bsz）
+            gpt2_model: GPT-2 模型实例（必选，用于执行前向传播）
+            past_key_values: 外部传入的注意力缓存（已禁用，强制使用 Prompt 生成的缓存）
+            src: 输入序列（预留参数，mode_para=2 时可能用于生成 Prompt 或拼接掩码）
+            tgt: 目标序列（预留参数，mode_para=2 时可能用于生成 Prompt 或拼接掩码）
+            src_attn: 输入序列的注意力掩码（mode_para=2 时拼接为完整掩码）
+            tgt_attn: 目标序列的注意力掩码（mode_para=2 时拼接为完整掩码）
+            **kwargs: 兼容 GPT-2 模型其他前向参数（如 labels、output_hidden_states 等）
+
+        Returns:
+
+        Notes:
+            - self.get_prompt: Prompt 生成方法
+            - self.mode_para: 运行模式开关（mode_para=2 时启用特殊逻辑：拼接注意力掩码）
+              mode_para=2 的特殊意义：从注释逻辑推测，mode_para=2 是「输入序列关联模式」：
+                此时 get_prompt 会传入 src（输入序列），生成与输入相关的 Prompt（如 p3_infix 插入式 Prompt，拼接输入序列特征）；
+                同时拼接 src_attn 和 tgt_attn 掩码，适配「输入 - 目标」双序列场景（如文本摘要、翻译）。
+            Prompt 如何影响模型生成？
+              GPT-2 的 past_key_values 是「历史注意力缓存」，用于存储之前 token 的 key/value 特征（避免重复计算）。本方法中：
+                - Prompt 生成的 past_key_values 会作为「初始历史缓存」传入模型；
+                - 模型生成第一个 token 时，会同时关注 input_ids 和 Prompt 缓存的特征，
+                  从而被 Prompt 引导（如遵循 Prompt 设定的风格、任务指令）。
+            为什么禁用外部 past_key_values？
+              - 避免冲突：如果外部传入 past_key_values，会覆盖 Prompt 缓存，导致 Prompt 失效；
+              - 设计初衷：本方法的核心是「Prompt 驱动」，强制使用自定义 Prompt 缓存，确保控制逻辑的一致性。
+        """
 
         # {"input_ids": batch, "labels": labels, 'src_attn': src_attn, 'tgt_attn':tgt_attn, 'src':src}
 
         bsz = input_ids.shape[0]
 
+        # mode_para=2 时，传入 src 生成 Prompt（可能是 infix 插入式 Prompt）
         # if self.mode_para == 2:
         #     past_key_values_prompt = self.get_prompt(src, gpt2=gpt2_model, bsz=bsz)
         # else:
 
+        # 生成与 GPT-2 兼容的 past_key_values 结构（每层 (key_prompt, value_prompt) 二元组）。
+        # 两种模式：
+        #   - 普通模式（默认）：仅传入 bsz，生成独立的 Prompt 缓存（如 p2/p6，不依赖输入序列 src）；
+        #   - mode_para=2 模式（注释中逻辑）：传入 src 和 gpt2_model，生成与输入序列相关的 Prompt（如 p3_infix 插入式 Prompt）。
         past_key_values_prompt = self.get_prompt(bsz=bsz)
 
+        # 禁用外部 past_key_values，强制使用 Prompt 缓存
+        # 限制：不允许外部传入 past_key_values（避免与 Prompt 缓存冲突），
+        # 强制模型使用 self.get_prompt 生成的 Prompt 缓存作为【初始注意力缓存】。
+        # 确保 Prompt 能完全引导模型的注意力计算，避免外部缓存干扰
         if past_key_values is not None:
             assert False, "Attention, use past_key_values for other things"
         else:
@@ -1314,9 +1370,17 @@ class PrefixTuning(PretrainedBartModel):
         if gpt2_model is None:
             assert False, "Didn't specify gpt2 model"
 
+        # 当 mode_para=2（可能是 encoder-decoder 或序列拼接场景）时，
+        #   将输入序列掩码 src_attn 和目标序列掩码 tgt_attn 沿「序列长度维度（dim=1）」拼接，
+        #   形成完整的注意力掩码（避免模型关注 Padding 或无效区域）。
+        # 非 mode_para=2 时：不拼接掩码，attention_mask 由 **kwargs 传入或使用模型默认值。
         if self.mode_para == 2 and src_attn is not None and tgt_attn is not None:
             attention_mask = torch.cat([src_attn, tgt_attn], dim=1)
 
+        # 将「输入 input_ids」和「Prompt 注意力缓存 past_key_values」传入 GPT-2，
+        #   模型会在生成时融合 Prompt 的特征（通过注意力机制关注 Prompt 的 key/value）。
+        # **kwargs：支持传入 GPT-2 其他参数（如 labels 用于微调损失计算、output_hidden_states=True 输出隐藏态等）。
+        # 输出格式：包含 logits、past_key_values、hidden_states 等，可直接用于生成文本或计算微调损失。
         output = gpt2_model(
             input_ids=input_ids, past_key_values=past_key_values, **kwargs
         )
