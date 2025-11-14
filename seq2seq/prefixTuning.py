@@ -1423,25 +1423,109 @@ class PrefixTuning(PretrainedBartModel):
         cate_attn=None,
         **kwargs,
     ):
+        """
+        针对「插入式 Prompt（Infix Prompt）」设计的前向传播方法，相比之前的 forward 方法，
+          它强化了「多序列拼接」和「插入式 Prompt」的适配。
+        新增参数为插入式 Prompt 提供更灵活的控制：
+          - control_code：驱动 Prompt 内容
+          - weights：调整 Prompt 影响强度
+        插入式 Prompt 的核心：
+          不是作为「前缀」加在输入前，而是作为「中间层」插入到「输入序列 src」和「目标序列 tgt」之间，
+            让模型在处理 tgt 时同时关注 src 和 Prompt。
+        核心逻辑是：
+          将 Prompt 作为「中间插入层」融入模型，通过拼接多段注意力掩码（src_attn + src_attn + tgt_attn）
+          适配「输入序列 - Prompt - 目标序列」的三段式结构，实现更精细的 Prompt 引导（区别于普通的「前缀 Prompt」）。
+
+        Args:
+            input_ids:
+            weights: 用于 Prompt 生成的权重调整
+            control_code: 用于 Prompt 生成的控制码
+            emb_match: 用于 Prompt 生成的嵌入匹配开关（传递给 GPT-2 或 get_prompt）
+            past_key_values:
+            attention_mask: 原始注意力掩码（最终会被「三段式掩码」覆盖）
+            token_type_ids:
+            position_ids:
+            head_mask:
+            inputs_embeds:
+            encoder_hidden_states:
+            encoder_attention_mask:
+            labels:
+            use_cache:
+            output_attentions:
+            output_hidden_states:
+            return_dict:
+            gpt2_model:
+            src:
+            tgt:
+            src_attn:
+            tgt_attn:
+            cate_batch: 类别相关批次（预留参数，可能用于类别特异性 Prompt 生成）
+            cate_attn: 类别相关掩码（预留参数，可能用于类别特异性 Prompt 生成）
+            **kwargs:
+
+        Returns:
+
+        Notes:
+            与普通 forward 方法的核心差异
+              对比维度	           普通 forward 方法	                   forward_infix 方法
+            Prompt 类型	         前缀 Prompt（加在输入前）	         插入式 Prompt（夹在 src 和 tgt 之间）
+            get_prompt 输入	     可选传入 src（仅 mode_para=2）	 强制传入 src（与输入序列关联）
+            注意力掩码	         单段掩码（或两段拼接）	             三段式拼接掩码（src_attn + Prompt_attn + tgt_attn）
+            控制参数	             无额外控制参数	                 支持 weights/emb_match 等扩展参数
+            适用场景	             通用可控生成	                     输入 - Prompt - 目标的三段式场景（如摘要、翻译、文本续写）
+
+        四、设计意图与适用场景
+        1. 设计意图
+          - 解决「前缀 Prompt」的局限性：前缀 Prompt 仅在输入前引导，
+              插入式 Prompt 能在「输入→目标」的过渡中持续引导，更适合需要输入与目标强关联的任务；
+          - 语义对齐：通过复用 src 的掩码作为 Prompt 掩码，确保 Prompt 与输入序列 src 语义一致，
+              引导模型在生成 tgt 时兼顾 src 和 Prompt 的约束。
+        2. 适用场景
+          - 文本摘要：src 是原始文本，Prompt 是「生成简洁摘要」的指令，tgt 是摘要文本
+             模型在原始文本和摘要之间插入 Prompt，确保摘要贴合原文且符合指令
+          - 机器翻译：src 是源语言文本，Prompt 是「翻译成目标语言」的指令，tgt 是目标语言文本
+             插入式 Prompt 强化跨语言语义对齐
+          - 文本续写：src 是前文，Prompt 是「保持风格一致续写」的指令，tgt 是续写文本
+             插入式 Prompt 确保续写内容与前文风格、语义连贯
+        五、关键注意事项
+          - Prompt 长度与掩码匹配：拼接后的掩码长度必须与
+              「src 长度 + Prompt 长度 + tgt 长度」完全一致，否则会导致维度不匹配报错；
+          - src_attn 复用逻辑：Prompt 掩码复用 src_attn 意味着 Prompt 与 src 无 Padding 且长度一致，
+              若 Prompt 长度与 src 不同，需单独生成 Prompt 的掩码（而非复用 src_attn）；
+          - 控制参数的作用：weights/emb_match 等参数需 GPT-2 模型支持（或在 get_prompt 中处理），
+              否则可能无效（代码中 control_code 显式置空，说明控制逻辑已在 Prompt 生成阶段完成）。
+        总结
+          forward_infix 是专为「插入式 Prompt」设计的前向传播方法，
+            核心创新是「三段式结构（src-Prompt-tgt）+ 三段式掩码拼接」，让 Prompt 能在输入与目标之间发挥过渡引导作用，
+              更适合需要输入 - 目标强关联的任务（如摘要、翻译）。
+            相比普通 forward，它强化了与输入序列的语义对齐，提供了更灵活的控制参数，
+              是 Prompt Tuning 框架中针对复杂生成任务的进阶实现。
+        """
 
         # {"input_ids": batch, "labels": labels, 'src_attn': src_attn, 'tgt_attn':tgt_attn, 'src':src}
 
         bsz = input_ids.shape[0]
+        # 生成插入式 Prompt 缓存
+        #
+        # 向 get_prompt 传入 src（输入序列）和 gpt2_model，
+        #   说明生成的 Prompt 是与输入序列 src 相关的插入式 Prompt（对应之前的 get_prompt_p3_infix 逻辑）。
+        #
+        past_key_values_prompt = self.get_prompt(
+            src, None, gpt2=gpt2_model, bsz=bsz
+        )
 
-        if self.mode_para == 2:
-            past_key_values_prompt = self.get_prompt(
-                src, None, gpt2=gpt2_model, bsz=bsz
-            )
-            attention_mask = torch.cat(
-                [src_attn, src_attn, tgt_attn], dim=1
-            )  # bsz, seqlen
-        else:
-            past_key_values_prompt = self.get_prompt(
-                src, None, gpt2=gpt2_model, bsz=bsz
-            )
-            attention_mask = torch.cat(
-                [src_attn, src_attn, tgt_attn], dim=1
-            )  # bsz, seqlen
+        # 拼接三段式注意力掩码；目的是：
+        #   告诉模型，三段式结构中哪些元素是有效数据（无 Padding），
+        #     确保注意力计算只关注有效元素，避免 Prompt 或 Padding 干扰。
+        #
+        # 掩码拼接逻辑对应「输入序列 src - Prompt - 目标序列 tgt」的三段式结构：
+        #   - 第一段 src_attn：输入序列 src 的注意力掩码（标记 src 中的有效元素）；
+        #   - 第二段 src_attn：Prompt 的注意力掩码（复用 src 的掩码，说明 Prompt 与 src 语义对齐，无额外 Padding）；
+        #   - 第三段 tgt_attn：目标序列 tgt 的注意力掩码（标记 tgt 中的有效元素）；
+        #   - 拼接维度 dim=1：沿「序列长度维度」拼接，最终掩码形状为 [bsz, len(src) + len(Prompt) + len(tgt)]，覆盖整个三段式序列。
+        attention_mask = torch.cat(
+            [src_attn, src_attn, tgt_attn], dim=1
+        )  # bsz, seqlen
 
         if past_key_values is not None:
             assert False, "Attention, use past_key_values for other things"
@@ -1450,14 +1534,15 @@ class PrefixTuning(PretrainedBartModel):
 
         if gpt2_model is None:
             assert False, "Didn't specify gpt2 model"
-
+        # 相比普通 forward，新增了 weights/emb_match 等控制参数，
+        #   让模型能根据需求调整 Prompt 的作用方式（如 weights 越大，Prompt 对生成的影响越强）。
         output = gpt2_model(
             input_ids=input_ids,
-            control_code=None,
-            weights=weights,
-            emb_match=emb_match,
-            past_key_values=past_key_values,
-            attention_mask=attention_mask,
+            control_code=None,   # 显式置空（控制逻辑已在 Prompt 生成时完成）
+            weights=weights,     # 传递权重参数（可能用于调整 Prompt 影响强度）
+            emb_match=emb_match, # 传递嵌入匹配开关
+            past_key_values=past_key_values,  # 插入式 Prompt 缓存
+            attention_mask=attention_mask,    # 三段式拼接掩码
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
