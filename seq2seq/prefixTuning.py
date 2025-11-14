@@ -1844,6 +1844,30 @@ class PrefixEmbTuning(GPT2PreTrainedModel):
         return past_key_values
 
     def get_prompt_p3_infix(self, src_x, control_code, gpt2=None, bsz=None):
+        """
+        专为「插入式 Prompt（Infix Prompt）」设计的缓存生成方法，
+        核心逻辑是将「输入序列嵌入（src_embs）」与「控制码驱动的 Prompt 嵌入（input_embs）」沿序列维度拼接，
+          再通过 GPT-2 前向传播自动生成原生兼容的 past_key_values。
+        这种设计让 Prompt 作为「中间插入层」夹在输入序列和后续生成序列之间，实现更精细的语义引导（区别于前缀 Prompt）。
+        Args:
+            src_x:
+            control_code:
+            gpt2:
+            bsz:
+
+        Returns:
+
+        Notes:
+            - temp_control = self.wte(control_code)
+            - input_embs = self.control_trans(temp_control) # 作用：优化控制码嵌入，让其更贴合 GPT-2 的语义空间，同时确保维度完全匹配。
+            -  temp_result = gpt2( # 作用：让 GPT-2 自动处理 Prompt 嵌入，生成原生兼容的注意力缓存（无需手动构造维度）
+                inputs_embeds=input_embs, use_cache=True, return_dict=True
+            )
+            「控制码 → Prompt 嵌入 → GPT-2 原生缓存生成」的核心链路，
+               本质是用控制码驱动生成符合 GPT-2 规范的注意力缓存（past_key_values），无需手动构造维度，兼容性和稳定性拉满。
+
+
+        """
         if control_code is not None:
             if self.wte:
                 temp_control = self.wte(control_code)
@@ -1890,6 +1914,17 @@ class PrefixEmbTuning(GPT2PreTrainedModel):
         return past_key_values
 
     def get_prompt_p4(self, control_code, gpt2=None, bsz=None):
+        """
+        基于 GPT-2 原生前向传播生成 Prompt 注意力缓存（past_key_values）
+        不依赖手动维度重塑，而是让 GPT-2 直接处理 Prompt 嵌入，自动生成符合模型规范的 past_key_values，兼容性更强、出错率更低。
+        Args:
+            control_code:
+            gpt2:
+            bsz:
+
+        Returns:
+
+        """
         # print(control_code, control_code.shape)
         if control_code is not None:
             if self.wte:
@@ -1948,22 +1983,32 @@ class PrefixEmbTuning(GPT2PreTrainedModel):
         self.format_mode = "cat"
         if self.mode_para == 2:
             if self.format_mode == "cat":
+                # 子模式1：用「输入 src + 类别 cate_batch」生成 Prompt
                 past_key_values_prompt = self.get_prompt(
                     src, cate_batch, gpt2=gpt2_model, bsz=bsz
                 )
+                # 三段式掩码：输入掩码 + 类别掩码 + 目标掩码（对应 Prompt 格式）
                 attention_mask = torch.cat([src_attn, cate_attn, tgt_attn], dim=1)
             else:
+                # 子模式2：用「输入 src + 输入 src」生成 Prompt（兼容早期逻辑）
                 past_key_values_prompt = self.get_prompt(
                     src, src, gpt2=gpt2_model, bsz=bsz
                 )
+                # 三段式掩码：输入掩码 + 输入掩码 + 目标掩码
                 attention_mask = torch.cat([src_attn, src_attn, tgt_attn], dim=1)
         else:
 
             past_key_values_prompt = self.get_prompt(
                 src, None, gpt2=gpt2_model, bsz=bsz
             )
+            # 自动生成 Prompt 对应的注意力掩码（全 True，无 Padding）
             bsz, seqlen = src.shape
-            temp_attn = torch.ones(bsz, self.preseqlen).bool()
+            # 核心亮点：temp_attn 自动生成 —— 无需外部传入 Prompt 掩码，
+            #   根据 self.preseqlen（预设 Prompt 长度）生成全 True 掩码，
+            #   默认 Prompt 无 Padding（有效长度 = preseqlen）；
+            # 适用场景：Prompt 是固定长度的通用指令（如 “生成简洁、正式的文本”），无需类别约束，简化掩码构造流程。
+            temp_attn = torch.ones(bsz, self.preseqlen).bool()  # [bsz, preseqlen]，全为 True
+            # 三段式掩码：输入掩码 + Prompt 掩码（全 True） + 目标掩码
             attention_mask = torch.cat([src_attn, temp_attn, tgt_attn], dim=1)
 
         if past_key_values is not None:
