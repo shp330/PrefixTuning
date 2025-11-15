@@ -14,6 +14,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
+from typing_extensions import override
 
 from callbacks import (
     Seq2SeqLoggingCallback,
@@ -330,9 +331,10 @@ class PrefixSummarizationModule(PrefixTransformer):
         )
         return base_metrics
 
+    @override
     def test_step(self, batch, batch_idx):
         return self._generative_step(batch)
-
+    @override
     def test_epoch_end(self, outputs):
         return self.validation_epoch_end(outputs, prefix="test")
 
@@ -348,6 +350,7 @@ class PrefixSummarizationModule(PrefixTransformer):
         )
         return dataset
 
+    @override
     def get_dataloader(
         self, type_path: str, batch_size: int, shuffle: bool = False
     ) -> DataLoader:
@@ -388,15 +391,18 @@ class PrefixSummarizationModule(PrefixTransformer):
                 sampler=None,
             )
 
+    @override
     def train_dataloader(self) -> DataLoader:
         dataloader = self.get_dataloader(
             "train", batch_size=self.hparams.train_batch_size, shuffle=True
         )
         return dataloader
 
+    @override
     def val_dataloader(self) -> DataLoader:
         return self.get_dataloader("val", batch_size=self.hparams.eval_batch_size)
 
+    @override
     def test_dataloader(self) -> DataLoader:
         return self.get_dataloader("test", batch_size=self.hparams.eval_batch_size)
 

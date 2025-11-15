@@ -7,6 +7,9 @@ from typing import Any, Dict
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info
 
+from abc import abstractmethod
+from  typing_extensions import override
+
 from transformers import (
     BartForConditionalGeneration,
     AdamW,
@@ -217,9 +220,11 @@ class PrefixTransformer(pl.LightningModule):
         scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
         return scheduler
 
+    @override
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
         model = self.model
+        # 不应使用 weight decay 的参数名关键词
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
@@ -259,6 +264,7 @@ class PrefixTransformer(pl.LightningModule):
 
         return [optimizer], [scheduler]
 
+    @override
     def test_step(self, batch, batch_nb):
         return self.validation_step(batch, batch_nb)
 
@@ -277,21 +283,25 @@ class PrefixTransformer(pl.LightningModule):
         dataset_size = len(self.train_loader.dataset)
         return (dataset_size / effective_batch_size) * self.hparams.max_epochs
 
+    @override
     def setup(self, mode):
         if mode == "fit":
             self.train_loader = self.get_dataloader(
                 "train", self.hparams.train_batch_size, shuffle=True
             )
 
+    @abstractmethod
     def get_dataloader(self, type_path, batch_size, shuffle=False):
         raise NotImplementedError("You must implement this for your task")
-
+    @override
     def train_dataloader(self):
         return self.train_loader
 
+    @override
     def val_dataloader(self):
         return self.get_dataloader("dev", self.hparams.eval_batch_size, shuffle=False)
 
+    @override
     def test_dataloader(self):
         return self.get_dataloader("test", self.hparams.eval_batch_size, shuffle=False)
 
