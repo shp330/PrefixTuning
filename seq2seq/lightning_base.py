@@ -8,7 +8,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info
 
 from abc import abstractmethod
-from  typing_extensions import override
+from typing_extensions import override
 
 from transformers import (
     BartForConditionalGeneration,
@@ -293,6 +293,7 @@ class PrefixTransformer(pl.LightningModule):
     @abstractmethod
     def get_dataloader(self, type_path, batch_size, shuffle=False):
         raise NotImplementedError("You must implement this for your task")
+
     @override
     def train_dataloader(self):
         return self.train_loader

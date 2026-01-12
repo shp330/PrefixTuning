@@ -182,6 +182,7 @@ class PrefixSummarizationModule(PrefixTransformer):
                 freeze_params(d.embed_positions)
                 freeze_params(d.embed_tokens)
 
+    @override
     def forward(self, input_ids, **kwargs):
         return self.model(input_ids, gpt2_model=self.seq2seq_model, **kwargs)
 
@@ -234,6 +235,7 @@ class PrefixSummarizationModule(PrefixTransformer):
     def pad(self) -> int:
         return self.tokenizer.pad_token_id
 
+    @override
     def training_step(self, batch, batch_idx) -> Dict:
         loss_tensors = self._step(batch)
 
@@ -257,39 +259,90 @@ class PrefixSummarizationModule(PrefixTransformer):
         # print('train_PPL = {}'.format(train_acc_mean.exp()))
         self.training_acc_across_batches_per_epoch = []  # reset for next epoch
 
+    @override
     def validation_step(self, batch, batch_idx) -> Dict:
         return self._generative_step(batch)
 
+    # PL 的生命周期钩子函数，在每个验证 epoch 结束后自动触发
     def validation_epoch_end(self, outputs, prefix="val") -> Dict:
+        """
+        在每个验证轮次（epoch）结束后，汇总整个验证集的所有批次输出结果，计算平均损失和生成式任务指标，
+        封装统一的指标字典并返回，为后续日志记录、模型最优值筛选（ModelCheckpoint）提供数据支撑。
+
+        Notes:
+            1. 汇总验证集所有批次的 outputs 结果（每个批次的损失、生成指标、预测结果等）；
+            2. 计算损失（如训练损失）和生成式指标（如 BLEU、ROUGE、生成时间 / 长度）的全局平均值；
+            3. 封装标准化的指标字典，添加前缀避免命名冲突，记录步骤数；
+            4. 保存指标到实例属性，展平预测结果；
+            5. 返回符合 PL 规范的结果，支持日志可视化和 Checkpoint 指标监控。
+            6. 包含了「gen_time（生成时间）」「gen_len（生成序列长度）」等专属指标,
+               以用于文本生成类任务（如机器翻译、摘要生成，也是 Prefix Tuning 的典型应用场景），因此。
+        Args:
+            outputs:
+            prefix:
+
+        Returns:
+
+        """
         self.step_count += 1
+        # 一. 汇总并计算验证损失的平均值
         losses = {
             k: torch.stack([x[k] for x in outputs]).mean() for k in self.loss_names
         }
         loss = losses["loss"]
         print(loss)
+        # 二. 汇总并计算生成式指标的平均值
+        # 为什么用 numpy 而非 torch？
+        #   1. 生成式指标（如 BLEU、ROUGE）在 validation_step 中通常已通过 nltk、rouge-score 等工具
+        #     计算为「Python 标量 /numpy 数组」，无梯度信息，无需保持 torch.Tensor 类型
+        #   2. numpy 对标量数组的平均值计算更高效，且后续保存和可视化更便捷。
         generative_metrics = {
             k: np.array([x[k] for x in outputs]).mean()
             for k in self.metric_names + ["gen_time", "gen_len"]
         }
+        # 三. 提取核心验证指标（用于模型筛选）
+        # 获取用于模型最优值筛选的「核心验证指标值」，兼容「生成式指标」和「损失指标」。
+        #
+        # self.val_metric 定义了「模型筛选的核心指标」（如 "bleu" 或 "loss"）；
+        # 若 self.val_metric 在生成式指标字典中（如 "bleu"），则取生成式指标值；否则取损失值（如 "loss"）；
+        # 适配不同的任务需求 —— 生成任务优先用 BLEU/ROUGE 等效果指标筛选模型，分类任务用损失值筛选，提升方法的通用性。
         metric_val = (
             generative_metrics[self.val_metric]
             if self.val_metric in generative_metrics
             else losses[self.val_metric]
         )
+        # 四. 将 metric_val（numpy 标量 / Python 标量）转为 torch.FloatTensor 类型，
+        #   且与 loss 保持「相同的数据类型和设备（CPU/GPU）」。
+        # 注：如果 metric_val 取 losses 则已经是 Tensor
+        # 原因：PL 的 ModelCheckpoint 回调在监控指标时，要求指标为 torch.Tensor 类型，无法直接使用 numpy 标量；
         metric_tensor: torch.FloatTensor = torch.tensor(metric_val).type_as(loss)
+        # 五. 合并损失与生成式指标（统一字典）: 将损失指标和生成式指标合并到同一个字典中，方便后续统一处理和保存。
+        # 将损失标量更新到生成式指标字典中；
         generative_metrics.update({k: v.item() for k, v in losses.items()})
+        # 将合并后的生成式指标（含损失）更新回 losses 字典，最终 losses 包含所有验证指标（损失 + BLEU+ROUGE + 生成时间 / 长度）
         losses.update(generative_metrics)
+        # 六. 封装标准化指标字典（添加前缀）
+        # 标准化命名格式（前缀_平均_指标名），如："val_avg_bleu"、"val_avg_gen_len"，方便后续日志分析和可视化
         all_metrics = {f"{prefix}_avg_{k}": x for k, x in losses.items()}
+        # 添加步骤计数器，记录该指标对应的验证步骤，便于后续时序分析（如绘制「步骤 - bleu 值」曲线）
         all_metrics["step_count"] = self.step_count
+        # 将标准化指标字典添加到 self.metrics 实例属性中，后续由自定义回调函数写入指定文件路径（self.metrics_save_path）
+        # 格式：{"val": [{}], "test": [{}]}，用于缓存各轮次的验证 / 测试指标；
+        # 该指标不会直接写入文件，而是由专门的回调函数（如自定义 MetricSaverCallback）
+        #   后续批量写入 self.metrics_save_path（如 .csv 或 .json 文件），方便后续离线分析
+        # callback writes this to self.metrics_save_path
         self.metrics[prefix].append(
             all_metrics
-        )  # callback writes this to self.metrics_save_path
+        )
+        # 提取所有批次的预测结果，展平为一维列表，方便后续保存和错误分析
+        # [[pred1, pred2], [pred3, pred4]]
         preds = flatten_list([x["preds"] for x in outputs])
+        # 七. 返回符合 PL 规范的结果字典
         return {
-            "log": all_metrics,
-            "preds": preds,
-            f"{prefix}_loss": loss,
-            f"{prefix}_{self.val_metric}": metric_tensor,
+            "log": all_metrics, # 标准化指标字典传入 PL 日志系统，支持 TensorBoard、Weights & Biases 等工具的可视化；
+            "preds": preds, # 返回展平后的预测结果，方便后续在回调函数中提取并保存；
+            f"{prefix}_loss": loss, # 返回核心损失张量，支持 PL 的 ModelCheckpoint 监控（如 monitor="val_loss"）
+            f"{prefix}_{self.val_metric}": metric_tensor, # 返回核心验证指标张量，支持 ModelCheckpoint 按效果指标（如 monitor="val_bleu"）筛选最优模型
         }
 
     def calc_generative_metrics(self, preds, target) -> Dict:
@@ -334,6 +387,7 @@ class PrefixSummarizationModule(PrefixTransformer):
     @override
     def test_step(self, batch, batch_idx):
         return self._generative_step(batch)
+
     @override
     def test_epoch_end(self, outputs):
         return self.validation_epoch_end(outputs, prefix="test")
