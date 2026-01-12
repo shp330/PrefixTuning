@@ -107,6 +107,7 @@ class PrefixTransformer(pl.LightningModule):
         # self.save_hyperparameters()
         # can also expand arguments into trainer signature for easier reading
 
+        self.opt = None
         self.save_hyperparameters(hparams)
         self.step_count = 0
         self.output_dir = Path(self.hparams.output_dir)
@@ -190,7 +191,7 @@ class PrefixTransformer(pl.LightningModule):
         config_prefix.format_mode = self.hparams.format_mode
         config_prefix.prefix_dropout = self.hparams.prefix_dropout
         config_prefix.vocab_size = len(self.tokenizer)
-        # some extra stuff.
+        # some extra stuff. 一些额外内容
         config_prefix.mid_dim = self.hparams.mid_dim
 
         # print(config_prefix)
@@ -290,7 +291,7 @@ class PrefixTransformer(pl.LightningModule):
                 "train", self.hparams.train_batch_size, shuffle=True
             )
 
-    @abstractmethod
+
     def get_dataloader(self, type_path, batch_size, shuffle=False):
         raise NotImplementedError("You must implement this for your task")
 
@@ -321,6 +322,11 @@ class PrefixTransformer(pl.LightningModule):
         print("Saving the the checkpoint.")
         return
 
+    # 进程过滤装饰器：确保被装饰的函数/方法仅在「rank=0」的进程（主进程 / 主节点）上执行，
+    #   其他 rank（从进程 / 从节点）的进程会直接跳过该函数，不执行任何逻辑。
+    #  「rank」是分布式训练（多 GPU / 多节点训练）中对进程的唯一编号，用于区分不同进程：
+    #   rank=0：默认是主进程（通常对应第 1 块 GPU / 第 1 个节点），负责统筹全局操作；
+    #   rank≥1：是从进程（其他 GPU / 其他节点），仅负责执行分布式训练中的部分计算任务
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any], filepath=None) -> None:
         # if filepath is not None:
@@ -415,6 +421,9 @@ class PrefixTransformer(pl.LightningModule):
         #     help="the default task, or dataset name. ",
         # )
 
+        # 是否对输入进行二次读取，包含四种策略：[中缀、拼接、窥视、不窥视]
+        # peek 窥视: 表示允许模型在二次读取输入时，查看特定区域的内容（如注意力机制可关注中缀部分），是一种输入访问策略
+        # nopeek 不窥视: 与 peek 相反，表示禁止模型在二次读取时查看特定区域，强制模型仅依赖已缓存的特征或前缀信息
         parser.add_argument(
             "--format_mode",
             default="cat",
