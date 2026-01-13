@@ -7,6 +7,23 @@ from torch import  nn
 class PrefixTuning(GPT2PreTrainedModel):
     """Classification Head for  transformer encoders"""
     def __init__(self, config, model_gpt2, optim_prefix=False, preseqlen=5, use_infix=False, deep_param=False):
+        """
+        以 self.optim_prefix（是否开启前缀优化）为核心，分为两大分支：
+          - 分支 1（not self.optim_prefix）：非前缀优化场景（微调词嵌入或基线模型，仅用于对比实验）；
+          - 分支 2（self.optim_prefix）：前缀优化核心场景（又细分「低数据场景」「浅层参数化」「深层参数化」三个子场景）。
+          - 核心功能：初始化前缀嵌入层（wte/wte_enc/wte2）、
+                    前缀投影层（control_trans 系列）、
+                    绑定前缀生成方法（get_prompt 系列），
+                    同时统计可训练参数量，体现 Prefix Tuning 「轻量高效」的特性。
+
+        Args:
+            config:
+            model_gpt2:
+            optim_prefix:
+            preseqlen:
+            use_infix:
+            deep_param:
+        """
         super().__init__(config)
         print('under the PrefixTuning model')
 
@@ -15,17 +32,17 @@ class PrefixTuning(GPT2PreTrainedModel):
         self.match_n_embd = config.n_embd // config.n_head
         self.n_embd = config.n_embd
 
-
+        # 1. 是否开启前缀优化（核心开关）
         if hasattr(config, 'optim_prefix'):
             self.optim_prefix = config.optim_prefix
         else:
             self.optim_prefix = optim_prefix
-
+        # 2. 前缀长度（preseqlen：prefix sequence length，核心超参数）
         if hasattr(config, 'preseqlen') and self.optim_prefix:
             self.preseqlen = config.preseqlen
         elif self.optim_prefix:
             self.preseqlen = preseqlen
-
+        # 3. 是否使用中缀（infix：前缀是前置，中缀是插入到序列中间，小众场景）
         if hasattr(config, 'use_infix'):
             self.use_infix = config.use_infix
         else:

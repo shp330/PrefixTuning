@@ -23,7 +23,7 @@ from transformers import (
     AutoModelWithLMHead,
     AutoTokenizer,
     PretrainedConfig,
-    PreTrainedTokenizer,
+    PreTrainedTokenizer, PreTrainedModel,
 )
 from transformers.optimization import (
     Adafactor,
@@ -91,6 +91,16 @@ class OurModelCheckPoint(pl.callbacks.ModelCheckpoint):
 
 
 class PrefixTransformer(pl.LightningModule):
+    """
+    Notes:
+        将 seq2seq_model 和 model 分开定义，可以通过 Module.parameters() 单独对两个模块的参数进行冻结或不冻结操作:
+
+    Attributes:
+        seq2seq_model: 主干模型
+        model: 微调模块
+    """
+    seq2seq_model: PreTrainedModel
+    model: PrefixTuning
     def __init__(
         self,
         hparams: argparse.Namespace,
@@ -101,7 +111,17 @@ class PrefixTransformer(pl.LightningModule):
         seq2seq_model=None,
         **config_kwargs,
     ):
-        """Initialize a model, tokenizer and config."""
+        """Initialize a model, tokenizer and config.
+
+        Args:
+            hparams:
+            num_labels:
+            mode:
+            config:
+            tokenizer:
+            seq2seq_model: 主干模型
+            **config_kwargs:
+        """
         super().__init__()
         # TODO: move to self.save_hyperparameters()
         # self.save_hyperparameters()
@@ -205,6 +225,7 @@ class PrefixTransformer(pl.LightningModule):
                 model_gpt2=self.seq2seq_model,
             )
         else:
+            # 子模块 self.model 是 nn.Module 类型，其参数会自动注册，包括：self.control_trans、self.wte
             self.model = PrefixTuning(config_prefix, self.seq2seq_model)
 
     def load_hf_checkpoint(self, *args, **kwargs):
@@ -224,6 +245,7 @@ class PrefixTransformer(pl.LightningModule):
     @override
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
+        # self.model 是 PrefixTuning 模块，其子模块 self.wte/self.control_trans 的参数也会加入优化器的参数列表，从而进行训练
         model = self.model
         # 不应使用 weight decay 的参数名关键词
         no_decay = ["bias", "LayerNorm.weight"]

@@ -114,6 +114,7 @@ class PrefixSummarizationModule(PrefixTransformer):
         # if self.hparams.freeze_embeds:
         #     self.freeze_embeds()
 
+        # 冻结主干模型
         freeze_params(self.seq2seq_model)
         assert_all_frozen(self.seq2seq_model)
         print("FREEZING ENTIRE seq2seq model.")

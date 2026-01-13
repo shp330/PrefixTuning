@@ -15,6 +15,15 @@ from typing import Optional, Literal, List, Tuple
 class PrefixTuning(PretrainedBartModel):
     """Classification Head for  transformer encoders
 
+    Notes:
+        完整的 prefix prompt 训练分为两阶段：
+          - 第 1 阶段（低数据初始化训练）：预对齐预训练模型特征（初始化训练），目的是让前缀 prompt 生成的特征，
+                对齐预训练模型（GPT-2）的原生注意力缓存特征，避免前缀随机初始化带来的训练不稳定性，提升后续下游任务的收敛速度
+                方法：lowdata_init_not_need_tokenize_train、lowdata_init_need_tokenize_train
+          - 第 2 阶段：适配下游任务（正式微调）
+          - 第 1 阶段只有 self.control_trans 会训练；第 2 阶段 self.wte、self.control_trans 会训练
+
+
     Attributes:
         preseqlen (int): Prompt 的序列长度（生成的 Prompt 包含多少个「虚拟 token」）（前缀优化序列长度？）
         optim_prefix (bool): 是否前缀优化
@@ -60,6 +69,7 @@ class PrefixTuning(PretrainedBartModel):
             无需通过词嵌入层转换，直接作为输入。
             是提前定义好的嵌入向量（而非离散 token 索引），可能是随机初始化后可训练的参数，
               或通过其他方式预优化的向量（如从预训练模型中提取的特征）。
+
     """
 
     preseqlen: int = 5
@@ -109,40 +119,41 @@ class PrefixTuning(PretrainedBartModel):
         self.match_n_head = config.decoder_attention_heads
         self.n_embd = config.d_model
         self.match_n_embd = self.n_embd // self.match_n_head
-
+        # 1. 是否开启前缀优化（核心开关）
         if hasattr(config, "optim_prefix"):
             self.optim_prefix = config.optim_prefix
         else:
             self.optim_prefix = optim_prefix
-
+        # 2. 前缀长度（preseqlen：prefix sequence length，核心超参数）
         if hasattr(config, "preseqlen") and self.optim_prefix:
             self.preseqlen = config.preseqlen
         elif self.optim_prefix:
             self.preseqlen = preseqlen
 
+        # 3. 是否使用中缀（infix：前缀是前置，中缀是插入到序列中间，小众场景）
         if hasattr(config, "use_infix"):
             self.use_infix = config.use_infix
         else:
             self.use_infix = use_infix
-
+        # 4. 是否使用深层参数化（deep_param：投影层是否增加隐藏层）
         if hasattr(config, "use_deep"):
             self.use_deep = config.use_deep == "yes"
         else:
             self.use_deep = False
 
         deep_param = self.use_deep
-
+        # 5. 调优模式（默认 prefixtune，确保仅前缀优化）
         if hasattr(config, "_my_arg_tune_mode"):
             self.tuning_mode = config._my_arg_tune_mode
         else:
             self.tuning_mode = "prefixtune"
-
+        # 6. 任务模式（必须指定，否则报错，如 dataless、data2text 等）
         if hasattr(config, "_my_arg_task_mode"):
             self.task_mode = config._my_arg_task_mode
         else:
             self.task_mode = "underspecified"
             assert False, "the task is underspecified"
-
+        # 7. 其他辅助参数（训练权重、格式模式、前缀 dropout、低数据场景等）
         if hasattr(config, "train_weights"):
             self.train_weights = config.train_weights == "yes"
         else:
@@ -153,6 +164,7 @@ class PrefixTuning(PretrainedBartModel):
         else:
             self.format_mode = "cat"
 
+        # prefix_dropout: dropout rate for the prefix tuning model.
         if hasattr(config, "prefix_dropout"):
             self.prefix_dropout = config.prefix_dropout
         else:
@@ -181,25 +193,29 @@ class PrefixTuning(PretrainedBartModel):
         else:
             self.lowdata_token = None
 
+        # 根据 task_mode 映射为 mode_para 整数，对应不同的前缀生成方法（get_prompt 系列），以适配不同任务的前缀需求
         if self.task_mode == "dataless":
-            self.mode_para = 1
+            self.mode_para = 1 # 无数据场景（仅依赖指令，无训练数据）
         elif (
-            self.task_mode == "data2text"
-            or self.task_mode == "triples"
-            or self.task_mode == "webnlg"
-            or self.task_mode == "writingPrompts"
+                self.task_mode == "data2text"
+                or self.task_mode == "triples"
+                or self.task_mode == "webnlg"
+                or self.task_mode == "writingPrompts"
         ):
             # with src and input based encoding.
-            self.mode_para = 2
+            self.mode_para = 2 # 数据到文本生成（如 WebNLG 三元组转文本）
             # self.mode_para=0 and optim_prefix == True for Instruction based.
         else:
-            self.mode_para = 4
-        # 不是前缀优化
+            self.mode_para = 4 # 主题/关键词/属性驱动生成（其他生成任务）
+        # 分支一：非前缀优化：仅用于构建基线模型（对比前缀优化的效果），分为「微调词嵌入」和「随机初始化词嵌入基线」两种
         if not self.optim_prefix:
+            # 一. 首先初始化主干模型的嵌入层权重
+            # 子场景 1：微调主干模型的词嵌入层（wte）
             if self.train_weights:
-                self.wte = model_gpt2.transformer.wte
+                self.wte = model_gpt2.transformer.wte # 加载 GPT-2 预训练词嵌入
                 for p in self.wte.parameters():
-                    p.requires_grad = True
+                    p.requires_grad = True # 开启词嵌入层训练（仅这部分，主体仍冻结）
+            # 子场景 2：基线模型（不加载预训练词嵌入，随机初始化）
             else:
                 if not self.init_random:
                     self.wte = None
@@ -211,10 +227,14 @@ class PrefixTuning(PretrainedBartModel):
                     print("BASELINE" * 100)
                     self.wte = nn.Embedding(config.vocab_size, config.n_embd)
                     print(self.wte)
-
-            # dataless
+            # 二. 初始化 control_trans 和 get_prompt
+            # control_trans 是「低维前缀投影层」，通过「线性层 + Tanh 激活」将低维前缀嵌入映射到 GPT-2 所需的高维维度
+            #   n_layer * 2 * n_embd，2 对应 key 和 value 两个注意力张量，是 Prefix Tuning 减少参数量的核心技巧
+            # 不同 mode_para 初始化对应的投影层（control_trans）和前缀生成方法（get_prompt）
+            # dataless 无数据场景
             if self.mode_para == 1:
                 print("mode_para=1, for dataless.")
+                # 低维投影层（核心：减少参数量）
                 self.control_trans = nn.Sequential(
                     nn.Linear(config.n_embd, self.mid_dim),
                     nn.Tanh(),
@@ -224,6 +244,7 @@ class PrefixTuning(PretrainedBartModel):
                     self.get_prompt = self.get_prompt_p4_infix
                 else:
                     self.get_prompt = self.get_prompt_p4
+            # mode_para=2 or 4, for data2text/topic generation.
             elif self.mode_para == 2 or self.mode_para == 4:
                 print(
                     "mode_para=2 or 4, for (2)data2text having a variable length input prefix parametrization. or for (4) topic/keyword/attributes..."
@@ -237,22 +258,23 @@ class PrefixTuning(PretrainedBartModel):
                     self.get_prompt = self.get_prompt_p3_infix
                 else:
                     self.get_prompt = self.get_prompt_p3
-
+            # mode_para=3, OLD VERSION: many parameters.
             elif self.mode_para == 3:
                 print("mode_para=3, OLD VERSION: many parameters.")
                 self.control_trans = nn.Sequential(
                     nn.Linear(
                         config.n_embd,
                         self.preseqlen * config.n_layer * 2 * config.n_embd,
-                    ),
+                        ),
                     nn.Tanh(),
                 )
                 if self.use_infix:
                     self.get_prompt = self.get_prompt_p1_infix
                 else:
                     self.get_prompt = self.get_prompt_p1
+        # 分支二：前缀优化
         else:
-            self.mode_para = 0
+            self.mode_para = 0 # mode_para = 0 指令式任务专用，分为「低数据场景」「普通浅层参数化」「普通深层参数化」三个场景
             print(
                 "mode_para=0, for data2text Instruction based, just optimize a set of parameters ;) "
             )
@@ -261,9 +283,12 @@ class PrefixTuning(PretrainedBartModel):
                     self.preseqlen
                 )
             )
-            # 低数据场景
+            # 场景1. 低数据场景
+            # 针对训练数据极少的场景，通过样本输入初始化前缀参数，提升模型收敛速度，分 3 种初始化方式（重点是 low_data_init=3）：
             if self.lowdata and self.lowdata_token is not None:
                 low_data_init = 3
+                # 三种初始化方式
+                # 方式 1：利用样本输入，【使用基础模型】初始化前缀张量（直接赋值 control_trans）
                 if low_data_init == 1:
                     print(
                         "IN THE LOW DATA SETTING, EXPLORE INITIALIZATION FOR DIRECT OPTIM..."
@@ -276,22 +301,26 @@ class PrefixTuning(PretrainedBartModel):
                     # 返回的都是 GPT2Tokenizer 类实例，差异仅在于分词器的词汇表（vocab）和配置（但 GPT-2 全系列共享同一套词汇表，因此实际差异极小）。
                     tokenizer = GPT2Tokenizer.from_pretrained("gpt2-medium")
                     sample_text = "name : Blue Spice | Type : coffee shop | customer rating : 5 out of 5 | near : Crowne Plaza Hotel||The coffee shop Blue Spice is based near Crowne Plaza Hotel and has a high customer rating of 5 out of 5 ."
+                    # src：原始数据表；tgt：目标文本
                     src, tgt = sample_text.split("||")
                     sample_input = (
-                        " {} {} ".format(src, tokenizer.bos_token)
-                        + tgt
-                        + " {}".format(tokenizer.eos_token)
+                            " {} {} ".format(src, tokenizer.bos_token)
+                            + tgt
+                            + " {}".format(tokenizer.eos_token)
                     )
                     self.control_trans = self.lowdata_init_train1(
                         gpt2=model_gpt2, tokenizer=tokenizer, sample_input=sample_input
                     )
                     print(self.control_trans.shape)
+                # 方式 2：初始化前缀嵌入层 + 投影层，利用样本【从零】训练初始化
+                # input_tokens 是前缀的虚拟令牌索引（无需对应真实词汇表），
+                # self.wte 是前缀专属嵌入层（形状 [preseqlen, n_embd]），这是 Prefix Tuning 「连续前缀嵌入」的核心载体。
                 elif low_data_init == 2:
                     print(
                         "IN THE LOW DATA SETTING, UNDER PARAMETRIZATION 1, need to train first"
                     )
-                    self.input_tokens = torch.arange(self.preseqlen).long()
-                    self.wte = nn.Embedding(self.preseqlen, config.n_embd)
+                    self.input_tokens = torch.arange(self.preseqlen).long() # 前缀令牌索引（0~preseqlen-1）
+                    self.wte = nn.Embedding(self.preseqlen, config.n_embd) # 前缀嵌入层（可训练，核心）
                     self.control_trans = nn.Sequential(
                         nn.Linear(config.n_embd, self.mid_dim),
                         nn.Tanh(),
@@ -304,11 +333,13 @@ class PrefixTuning(PretrainedBartModel):
                     sample_text = "name : Blue Spice | Type : coffee shop | customer rating : 5 out of 5 | near : Crowne Plaza Hotel||The coffee shop Blue Spice is based near Crowne Plaza Hotel and has a high customer rating of 5 out of 5 ."
                     src, tgt = sample_text.split("||")
                     sample_input = (
-                        " {} {} ".format(src, tokenizer.bos_token)
-                        + tgt
-                        + " {}".format(tokenizer.eos_token)
+                            " {} {} ".format(src, tokenizer.bos_token)
+                            + tgt
+                            + " {}".format(tokenizer.eos_token)
                     )
 
+                # 方式 3：预定义 token 初始化，统一与微调逻辑（最常用）
+                # 初始化前缀嵌入层 + 投影层，使用 lowdata_token 而非样本初始化
                 elif low_data_init == 3:
                     # use a single prepended token.
                     assert self.lowdata_token is not None
@@ -318,7 +349,8 @@ class PrefixTuning(PretrainedBartModel):
                         "preseqlen = {} Unifying with FINETUNE".format(self.preseqlen)
                     )
                     self.input_tokens = torch.arange(self.preseqlen).long()
-                    self.wte = nn.Embedding(self.preseqlen, config.n_embd)
+                    self.wte = nn.Embedding(self.preseqlen, config.n_embd) # 前缀嵌入层（可训练）
+                    # 浅层投影层
                     self.control_trans = nn.Sequential(
                         nn.Linear(config.n_embd, self.mid_dim),
                         nn.Tanh(),
@@ -327,11 +359,15 @@ class PrefixTuning(PretrainedBartModel):
                     self.get_prompt = self.get_prompt_p5
 
             # DIFFERENT PARAMETRIZATION:
+            # 普通浅层参数化（主流）
+            # 非低数据场景的默认选择，投影层为「两层线性 + 一层 Tanh」（浅层），同时支持「编码器前缀」和「交叉注意力前缀」
+            #   （适配 Encoder-Decoder 结构，此处兼容 GPT-2 Decoder-only 结构）：
             elif not deep_param:
-                low_data_init = 0
+                low_data_init = 0 # 非低数据场景
                 print("UNDER PARAMETRIZATION 1")
                 self.input_tokens = torch.arange(self.preseqlen).long()
-                self.wte = nn.Embedding(self.preseqlen, self.n_embd)
+                self.wte = nn.Embedding(self.preseqlen, self.n_embd) # 解码器前缀嵌入层
+                # 浅层投影层（核心）
                 self.control_trans = nn.Sequential(
                     nn.Linear(self.n_embd, self.mid_dim),
                     nn.Tanh(),
@@ -342,11 +378,12 @@ class PrefixTuning(PretrainedBartModel):
                 else:
                     self.get_prompt = self.get_prompt_p5
 
-                self.use_encoder_prefix = True
-                self.use_cross_prefix = True
-
+                # 同时支持「编码器前缀」和「交叉注意力前缀」
+                self.use_encoder_prefix = True # 使用编码器前缀：适配 Encoder-Decoder 模型，如 T5
+                self.use_cross_prefix = True # 使用交叉注意力前缀：适配 Encoder-Decoder 模型的交叉注意力层
                 if self.use_encoder_prefix:
-                    self.wte_enc = nn.Embedding(self.preseqlen, self.n_embd)
+                    self.wte_enc = nn.Embedding(self.preseqlen, self.n_embd) # 编码器前缀嵌入层
+                    # 编码器浅层投影层
                     self.control_trans_enc = nn.Sequential(
                         nn.Linear(self.n_embd, self.mid_dim),
                         nn.Tanh(),
@@ -354,19 +391,22 @@ class PrefixTuning(PretrainedBartModel):
                     )
 
                 if self.use_cross_prefix:
-                    self.wte2 = nn.Embedding(self.preseqlen, self.n_embd)
+                    self.wte2 = nn.Embedding(self.preseqlen, self.n_embd) # 交叉注意力前缀投影层
+                    # 交叉注意力浅层投影层
                     self.control_trans2 = nn.Sequential(
                         nn.Linear(self.n_embd, self.mid_dim),
                         nn.Tanh(),
                         nn.Linear(self.mid_dim, self.match_n_layer * 2 * self.n_embd),
                     )
-
+            # 普通深层参数化（增强表达能力）
+            # 与浅层参数化的区别是「投影层增加一层线性 + Tanh」（深层），提升前缀的表达能力，适合复杂任务，其余逻辑与浅层一致
             else:
-                low_data_init = 0
+                low_data_init = 0 # 非低数据场景
                 print("UNDER PARAMETRIZATION DEEP 1")
 
                 self.input_tokens = torch.arange(self.preseqlen).long()
                 self.wte = nn.Embedding(self.preseqlen, self.n_embd)
+                # 深层投影层（多一层 Linear+Tanh）
                 self.control_trans = nn.Sequential(
                     nn.Linear(self.n_embd, self.mid_dim),
                     nn.Tanh(),
@@ -379,6 +419,7 @@ class PrefixTuning(PretrainedBartModel):
                 else:
                     self.get_prompt = self.get_prompt_p5
 
+                # 编码器前缀 + 交叉注意力前缀（深层投影层）
                 self.use_encoder_prefix = True
                 self.use_cross_prefix = True
 
@@ -401,18 +442,21 @@ class PrefixTuning(PretrainedBartModel):
                         nn.Tanh(),
                         nn.Linear(self.mid_dim, self.match_n_layer * 2 * self.n_embd),
                     )
-
+        # 1. 前缀 dropout 层（防止前缀过拟合，仅作用于前缀参数）
         self.dropout = nn.Dropout(self.prefix_dropout)
+        # 2. 中缀场景绑定对应的 forward 方法
         if self.use_infix:
             self.forward = self.forward_infix
 
         ###### just trying #########
+        # 3. 统计可训练参数量（体现 Prefix Tuning 轻量性）
         total_param = 0
         for name, param in self.named_parameters():
             print(param.shape)
             total_param += param.numel()
         print("total param is {}".format(total_param))
 
+        # 4. 低数据场景补充初始化（根据 low_data_init 执行对应的训练初始化方法）
         if low_data_init == 2:
             self.lowdata_init_need_tokenize_train(
                 gpt2=model_gpt2, tokenizer=tokenizer, sample_input=sample_input
@@ -905,6 +949,11 @@ class PrefixTuning(PretrainedBartModel):
           适配支持 encoder-decoder 结构或交叉注意力机制的模型（如某些基于 GPT-2 扩展的模型）。
           其输出不仅包含与 GPT-2 past_key_values 兼容的键值对，还可根据配置添加交叉注意力、编码器相关的缓存，
           适用于更复杂的条件生成场景（如文本摘要、翻译等需要编码器-解码器交互的任务）。
+
+       control_trans 是一个 MLP 或线性层，用于将 soft prompt embeddings（temp_control）映射为多层 Transformer 的 Key/Value 缓存格式。
+         这是 Prefix Tuning v2 / P-Tuning v2 的典型设计：不直接优化 KV cache，而是通过一个小网络生成它，提升训练稳定性。
+         因此，训练目标是让这个小网络学会生成与真实输入（sample_input）对应的 past key-values，从而让模型“以为”看到了该输入
+
         Args:
             control_code:
             gpt2:
@@ -939,13 +988,11 @@ class PrefixTuning(PretrainedBartModel):
         bsz = bsz * sample_size
 
         # 1. 生成输入 token 并扩展批次
-        # self.input_tokens：预定义的 Prompt 输入 token（整数索引张量，作为生成 Prompt 的基础）
+        # self.input_tokens：虚拟 Prompt token（整数索引张量，作为生成 Prompt 的基础）
         # 形状：[bsz, preseqlen]（preseqlen 是 self.input_tokens 的长度，即 Prompt 序列长）
         input_tokens = self.input_tokens.unsqueeze(0).expand(bsz, -1).to(self.device)
 
-        # 2. 嵌入输入 token 为向量
-        # self.wte / self.wte2 / self.wte_enc：
-        #   不同场景的词嵌入层（分别用于自注意力、交叉注意力、编码器的 Prompt 嵌入）
+        # 2. wte 为前缀嵌入
         temp_control = self.wte(
             input_tokens
         )  # temp_control 形状：[bsz, preseqlen, emb_size]
