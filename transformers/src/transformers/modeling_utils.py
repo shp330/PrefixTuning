@@ -711,7 +711,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
             # xm.save takes care of saving only from master
             xm.save(state_dict, output_model_file)
         else:
-            model_to_save.config.save_pretrained(save_directory)
+            model_to_save.config.save_pretrained(save_directory) # 保存配置
             torch.save(state_dict, output_model_file)
 
         logger.info("Model weights saved in {}".format(output_model_file))
