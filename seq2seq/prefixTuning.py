@@ -228,8 +228,12 @@ class PrefixTuning(PretrainedBartModel):
                     self.wte = nn.Embedding(config.vocab_size, config.n_embd)
                     print(self.wte)
             # 二. 初始化 control_trans 和 get_prompt
-            # control_trans 是「低维前缀投影层」，通过「线性层 + Tanh 激活」将低维前缀嵌入映射到 GPT-2 所需的高维维度
-            #   n_layer * 2 * n_embd，2 对应 key 和 value 两个注意力张量，是 Prefix Tuning 减少参数量的核心技巧
+            # - control_trans 是「低维前缀投影层」，通过「线性层 + Tanh 激活」将低维前缀嵌入映射到 GPT-2 所需的高维维度
+            #     n_layer * 2 * n_embd，2 对应 key 和 value 两个注意力张量，是 Prefix Tuning 减少参数量的核心技巧
+            # - get_prompt 生成的是【任务级】的提示，跟具体 input_ids 没有关系。
+            #     训练时：根据 self.control_trans 网络生成  past_key_values，并隐式拼接到 input_ids 前，
+            #       通过训练 self.control_trans 的参数，达到学习 prompt 的目的。
+            #     推理时：不会根据不同的 input_ids 生成不同的提示，而是利用已学习好的 self.control_trans 生成固定的 prompt
             # 不同 mode_para 初始化对应的投影层（control_trans）和前缀生成方法（get_prompt）
             # dataless 无数据场景
             if self.mode_para == 1:
