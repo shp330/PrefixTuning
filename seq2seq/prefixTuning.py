@@ -507,7 +507,14 @@ class PrefixTuning(PretrainedBartModel):
             - 设备一致性：需确保 sample_input 编码后的张量与 gpt2 模型在同一设备（CPU/GPU），否则会报错【代码中通过 .to(gpt2.device) 处理】。
             - 模型类型：仅适用于支持 past_key_values 的自回归模型（如 GPT 系列），其他模型（如 BERT）不支持该参数。
             - 张量形状：拼接后的张量维度较高（num_layers * 2, 1, num_heads, seq_len, head_dim），需确保后续模块能处理该形状。
+        Examples:
+            >>> layer_0_kv = torch.tensor([[1, 2, 3], [4, 5, 6]])
+            >>> layer_1_kv = torch.tensor([[11, 12, 13], [14, 15, 16]])
 
+            >>> kv_cache = (layer_0_kv, layer_1_kv)
+            >>> kv_cache_cat = torch.cat(kv_cache, dim=0)
+            >>> print("kv_cache_cat", kv_cache_cat)
+            >>> [[ 1,  2,  3], [ 4,  5,  6], [11, 12, 13], [14, 15, 16]]
         Returns:
 
         """
@@ -555,7 +562,8 @@ class PrefixTuning(PretrainedBartModel):
         # - torch.cat(output, dim=0)：
         #     将 past_key_values 元组中的所有 (key, value) 二元组沿 dim=0（层数维度）拼接。
         #     拼接前：每个元素是 (key, value)（形状均为 [1, num_heads, seq_len, head_dim]），元组长度为 num_layers。
-        #     拼接后：张量形状为 [num_layers * 2, 1, num_heads, seq_len, head_dim]（因为每个层贡献 2 个张量（key+value），所以第一维是 num_layers * 2）。
+        #     拼接后：张量形状为 [num_layers * 2, 1, num_heads, seq_len, head_dim]（因为每个层贡献 2 个张量（key+value），
+        #            所以第一维是 num_layers * 2）。
         # - detach()：
         #     剥离张量的计算图（切断与模型前向传播的梯度依赖），使其成为「纯数据张量」（
         #     后续转换为参数时，梯度会重新计算，此处仅为了脱离原始模型的计算图）。
