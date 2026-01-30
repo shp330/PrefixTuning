@@ -91,7 +91,7 @@ class OurModelCheckPoint(pl.callbacks.ModelCheckpoint):
 
 
 class PrefixTransformer(pl.LightningModule):
-    """
+    """纯模型逻辑
     Notes:
         将 seq2seq_model 和 model 分开定义，可以通过 Module.parameters() 单独对两个模块的参数进行冻结或不冻结操作:
 

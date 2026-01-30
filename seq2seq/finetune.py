@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 class PrefixSummarizationModule(PrefixTransformer):
+    """包含特定数据集逻辑"""
     mode = "summarization"
     loss_names = ["loss"]
     metric_names = ROUGE_KEYS
